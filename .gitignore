@@ -1,3 +1,7 @@
+# Agent 配置文件
+AGENTS.md
+CLAUDE.md
+
 # API Keys / 敏感配置
 config/config.yaml
 
