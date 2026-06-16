@@ -12,7 +12,9 @@ import os
 import re
 import shutil
 import socket
+import ssl
 import sys
+import traceback
 import tempfile
 import threading
 import time
@@ -1263,10 +1265,70 @@ def normalize_base_url(base_url: str) -> str:
 
 # ---------------------------- OpenAI 兼容 HTTP 代理 ----------------------------
 
+@dataclass
+class TokenUsage:
+    """Token 用量统计，支持日/月自动清零。
+
+    - 当日用量在每日零点清零
+    - 当月用量在每月1日零点清零
+    """
+    daily_prompt: int = 0
+    daily_completion: int = 0
+    daily_total: int = 0
+    monthly_prompt: int = 0
+    monthly_completion: int = 0
+    monthly_total: int = 0
+    last_date: str = ""
+    last_month: str = ""
+
+    def record(self, prompt: int, completion: int) -> None:
+        """记录一次 API 调用的 token 用量，自动处理日/月切换。"""
+        today = datetime.now().strftime("%Y-%m-%d")
+        this_month = datetime.now().strftime("%Y-%m")
+
+        # 检测日切换
+        if self.last_date and self.last_date != today:
+            self.daily_prompt = 0
+            self.daily_completion = 0
+            self.daily_total = 0
+
+        # 检测月切换
+        if self.last_month and self.last_month != this_month:
+            self.monthly_prompt = 0
+            self.monthly_completion = 0
+            self.monthly_total = 0
+
+        total = prompt + completion
+        self.daily_prompt += prompt
+        self.daily_completion += completion
+        self.daily_total += total
+        self.monthly_prompt += prompt
+        self.monthly_completion += completion
+        self.monthly_total += total
+        self.last_date = today
+        self.last_month = this_month
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "TokenUsage":
+        return cls(
+            daily_prompt=data.get("daily_prompt", 0),
+            daily_completion=data.get("daily_completion", 0),
+            daily_total=data.get("daily_total", 0),
+            monthly_prompt=data.get("monthly_prompt", 0),
+            monthly_completion=data.get("monthly_completion", 0),
+            monthly_total=data.get("monthly_total", 0),
+            last_date=data.get("last_date", ""),
+            last_month=data.get("last_month", ""),
+        )
+
+
 class ProxyState:
     """代理全局状态。
 
-    代理启动时会读取 ProviderManager，按“当前激活服务商”转发。
+    代理启动时会读取 ProviderManager，按"当前激活服务商"转发。
     通过 set_provider() 可在运行中切换（无需重启代理）。
     支持通过 logger_cb 把运行日志回传到 GUI。
     """
@@ -1275,6 +1337,7 @@ class ProxyState:
         self.manager = manager
         self._lock = threading.Lock()
         self.virtual_model = HERMES_VIRTUAL_MODEL
+        self.proxy_api_key: Optional[str] = None
         self.logger_cb: Optional[Callable[[str, str], None]] = None
         self.static_models = [
             {"id": self.virtual_model, "object": "model", "owned_by": "ccswitch"},
@@ -1286,6 +1349,47 @@ class ProxyState:
             {"id": "claude-opus-4", "object": "model", "owned_by": "anthropic"},
             {"id": "claude-sonnet-4", "object": "model", "owned_by": "anthropic"},
         ]
+        self.token_usage = TokenUsage()
+        self._token_file = self.manager.config_dir / "token_usage.json"
+        self._load_token_usage()
+
+    # ---------- token 用量 ----------
+
+    def _load_token_usage(self) -> None:
+        """从文件加载持久化的 token 用量。"""
+        try:
+            if self._token_file.exists():
+                raw = json.loads(self._token_file.read_text(encoding="utf-8"))
+                self.token_usage = TokenUsage.from_dict(raw)
+        except Exception as e:
+            logger.warning("token_usage 加载失败: %s", e)
+
+    def _save_token_usage(self) -> None:
+        """持久化 token 用量到文件。"""
+        try:
+            self._token_file.write_text(
+                json.dumps(self.token_usage.to_dict(), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as e:
+            logger.warning("token_usage 保存失败: %s", e)
+
+    def record_tokens(self, prompt_tokens: int, completion_tokens: int) -> None:
+        """记录一次 API 调用的 token 用量并持久化。"""
+        with self._lock:
+            self.token_usage.record(prompt_tokens, completion_tokens)
+            self._save_token_usage()
+
+    def get_token_summary(self) -> str:
+        """获取当日/当月 token 用量摘要文本。"""
+        with self._lock:
+            t = self.token_usage
+            return (
+                f"📊 当日: ↑{t.daily_prompt} ↓{t.daily_completion} ∑{t.daily_total}  |  "
+                f"当月: ↑{t.monthly_prompt} ↓{t.monthly_completion} ∑{t.monthly_total}"
+            )
+
+    # ---------- 原方法 ----------
 
     def current(self) -> Optional[Provider]:
         with self._lock:
@@ -1347,6 +1451,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
         p = (path or "").strip()
         if p.endswith("/") and len(p) > 1:
             p = p[:-1]
+        # 兼容客户端 base_url 尾部带 /v1 再拼 /v1/xxx 的情况（如 /v1/v1/messages）
+        if p.startswith("/v1/v1"):
+            p = "/v1" + p[6:]  # /v1/v1/xxx -> /v1/xxx
 
         if method == "GET":
             if p in ("/v1/models", "/models"):
@@ -1388,17 +1495,85 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self._send_json(404, {"error": {"message": f"not found: {path}", "type": "not_found"}})
 
     def do_GET(self) -> None:  # noqa: N802
-        self._dispatch("GET", self.path.split("?")[0])
+        if not self._check_auth():
+            return
+        try:
+            self._dispatch("GET", self.path.split("?")[0])
+        except Exception as e:
+            self._safe_error(e)
 
     def do_POST(self) -> None:  # noqa: N802
-        self._dispatch("POST", self.path.split("?")[0])
+        if not self._check_auth():
+            return
+        try:
+            self._dispatch("POST", self.path.split("?")[0])
+        except Exception as e:
+            self._safe_error(e)
+
+    def _safe_error(self, e: Exception) -> None:
+        """安全的 500 错误响应，确保不会二次异常。"""
+        tb = "".join(traceback.format_exception(type(e), e, e.__traceback__))
+        print(f"[FATAL] 请求处理异常:\n{tb}", file=sys.__stderr__, flush=True)
+        try:
+            if self.state is not None:
+                self.state.emit("❌", f"请求处理异常:\n{tb}")
+        except Exception:
+            pass
+        try:
+            self._send_json(500, {"error": {"message": f"internal error: {type(e).__name__}: {e}", "detail": tb[-500:]}})
+        except Exception:
+            try:
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(b'{"error":{"message":"internal error","type":"internal_error"}}')
+            except Exception:
+                pass
 
     def do_OPTIONS(self) -> None:  # noqa: N802
-        self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
-        self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
-        self.end_headers()
+        try:
+            self.send_response(204)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
+            self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+            self.end_headers()
+        except Exception:
+            pass
+
+    def do_HEAD(self) -> None:  # noqa: N802
+        self._safe_error(Exception("method HEAD not supported"))
+
+    def do_DELETE(self) -> None:  # noqa: N802
+        self._safe_error(Exception("method DELETE not supported"))
+
+    def _check_auth(self) -> bool:
+        """可选的代理 API Key 校验：代理 key 为空时不校验；不为空时必须匹配。"""
+        try:
+            proxy_key = None
+            if self.state is not None:
+                proxy_key = getattr(self.state, "proxy_api_key", None)
+            if not proxy_key:
+                return True
+            auth = self.headers.get("Authorization", "")
+            token = ""
+            if auth.lower().startswith("bearer "):
+                token = auth[7:].strip()
+            else:
+                token = auth.strip()
+            x_api_key = self.headers.get("x-api-key", "").strip()
+            if token and token == proxy_key:
+                return True
+            if x_api_key and x_api_key == proxy_key:
+                return True
+            self._send_json(401, {
+                "error": {
+                    "message": "Unauthorized: missing or invalid proxy API key",
+                    "type": "auth_error",
+                }
+            })
+            return False
+        except Exception:
+            return True
 
     # ------------------ 具体处理 ------------------
     def _handle_models(self) -> None:
@@ -1428,15 +1603,22 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def _upstream_endpoint(self, provider: Provider, action: str) -> str:
         """拼上游完整 URL。
 
-        处理用户填写 base_url 带 /v1 或不带 /v1 两种情况，避免重复拼接。
+        处理用户填写 base_url 带 /v1、/v3、/v4、/v5 等版本前缀的情况，
+        避免重复拼接（例如智谱 base_url=https://open.bigmodel.cn/api/paas/v4/
+        再拼 /v1/chat/completions 就变成 /v4/v1/chat/completions 404）。
+
+        规则：
+          - base 中已含 /v1、/v3、/v4 或 /v5 → 直接拼 action（不再加 /v1）
+          - 否则 → 拼 /v1/action（标准 OpenAI）
         """
         base = normalize_base_url(provider.base_url) or ""
         base = base.rstrip("/")
-        if base.endswith("/v1"):
-            # 已经带 /v1：直接拼 action
-            return base + "/" + action.lstrip("/")
-        # 统一拼 /v1/action
-        return base + "/v1/" + action.lstrip("/")
+        action_clean = action.lstrip("/")
+        if "/v1" in base or "/v3" in base or "/v4" in base or "/v5" in base:
+            # 已含 API 版本前缀，直接拼 action
+            return base + "/" + action_clean
+        # 统一拼 /v1/action（OpenAI 标准）
+        return base + "/v1/" + action_clean
 
     def _rewrite_payload_for_provider(self, provider: Provider, action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         """虚拟模型 -> 真实模型映射。
@@ -1495,13 +1677,69 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 except Exception:
                     p[key] = DEFAULT_MAX_TOKENS
 
-        # ----------- stream 兜底 -----------
-        # Hermes/Claude Code 会传 stream=true，但 stream_options 格式上游可能不认
-        # 干脆把 stream_options 丢掉（我们不做增量响应）
+        # ----------- stream 对齐 -----------
+        # 统一把 stream 参数强制对齐：客户端要非流式就不要向上游发 stream=true，
+        # 避免某些服务商（智谱）对 stream=true 非流式回调路径异常。
+        # 客户端原始意图从 self._handle_chat_completions 里直接看
+        # 这里只做一件事：把 stream_options 丢掉，并确保 stream 是布尔值
         if "stream_options" in p:
             p.pop("stream_options", None)
+        if "stream" in p:
+            try:
+                p["stream"] = bool(p["stream"])
+            except Exception:
+                p["stream"] = False
 
         return p
+
+    @staticmethod
+    def _extract_usage_from_stream(raw: bytes) -> Dict[str, int]:
+        """从 SSE 流式响应体中提取 token 用量。
+
+        OpenAI 兼容服务商在结束前发送包含 usage 的 data: {...} 事件，
+        格式如：data: {"id":"...","choices":[],"usage":{"prompt_tokens":N,"completion_tokens":N,...}}
+        """
+        usage: Dict[str, int] = {}
+        try:
+            text = raw.decode("utf-8", errors="replace")
+            for line in text.split("\n"):
+                line = line.strip()
+                if line.startswith("data:") and line != "data: [DONE]":
+                    chunk = line[5:].strip()
+                    if chunk:
+                        try:
+                            obj = json.loads(chunk)
+                            u = obj.get("usage")
+                            if u and isinstance(u, dict):
+                                usage = u
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+        return usage
+
+    def _extract_usage_from_response(self, resp_body: Any, stream_body: Optional[bytes]) -> Dict[str, int]:
+        """从上游响应中提取 token 用量。"""
+        usage: Dict[str, int] = {}
+        # 非流式：resp_body 是 dict，直接取 usage 字段
+        if isinstance(resp_body, dict):
+            u = resp_body.get("usage")
+            if u and isinstance(u, dict):
+                return dict(u)
+        # 流式：从原始 bytes 中解析
+        if stream_body:
+            return ProxyHandler._extract_usage_from_stream(stream_body)
+        return usage
+
+    def _count_response_tokens(self, resp_body: Any, stream_body: Optional[bytes]) -> None:
+        """从上游响应提取 token 并记录到状态。"""
+        usage = self._extract_usage_from_response(resp_body, stream_body)
+        prompt = usage.get("prompt_tokens", 0) or 0
+        completion = usage.get("completion_tokens", 0) or 0
+        if prompt > 0 or completion > 0:
+            self.state.record_tokens(prompt, completion)
+            total = prompt + completion
+            self.state.emit("📊", f"tokens: ↑{prompt} ↓{completion} ∑{total}")
 
     def _handle_chat_completions(self) -> None:
         assert self.state is not None
@@ -1529,6 +1767,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if stream and isinstance(resp_body, (bytes, bytearray)):
             try:
                 body = bytes(resp_body)
+                self._count_response_tokens(None, body)
                 ctype = resp_headers.get("content-type", "text/event-stream")
                 self.send_response(resp_code)
                 self.send_header("Content-Type", ctype)
@@ -1546,11 +1785,22 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self.state.emit("❌", f"stream 写回客户端失败: {e}")
                 return
 
-        # 非流式
+        # 非流式（token 计数不会中断请求）
         try:
-            self._send_json(resp_code, resp_body if isinstance(resp_body, dict) else {"content": str(resp_body) if resp_body is not None else ""})
+            self._count_response_tokens(resp_body, None)
         except Exception:
-            self._send_json(resp_code, {"content": str(resp_body) if resp_body is not None else ""})
+            pass
+        if resp_code >= 400:
+            # 错误响应：原样透传，不包装
+            if isinstance(resp_body, dict):
+                self._send_json(resp_code, resp_body)
+            else:
+                self._send_json(resp_code, {"error": {"message": str(resp_body), "type": "upstream_error"}})
+        else:
+            try:
+                self._send_json(resp_code, resp_body if isinstance(resp_body, dict) else {"content": str(resp_body) if resp_body is not None else ""})
+            except Exception:
+                self._send_json(resp_code, {"content": str(resp_body) if resp_body is not None else ""})
 
     def _handle_responses(self) -> None:
         """OpenAI /v1/responses 新版 API：上游大多不支持，自动转成 chat.completions。"""
@@ -1581,6 +1831,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._send_json(502, {"error": {"message": f"upstream error: {e}", "type": "upstream_error"}})
             return
 
+        # token 计数（不会因此中断请求）
+        try:
+            self._count_response_tokens(resp_body, bytes(resp_body) if isinstance(resp_body, (bytes, bytearray)) else None)
+        except Exception:
+            pass
+
         # 流式透传
         if stream and isinstance(resp_body, (bytes, bytearray)):
             try:
@@ -1597,12 +1853,18 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 return
 
         # 非流式：把 chat.completions 响应再包装成 responses 格式
-        try:
-            if isinstance(resp_body, dict) and "choices" in resp_body:
-                return self._chat_to_responses(resp_body)
-            self._send_json(resp_code, resp_body if isinstance(resp_body, dict) else {"content": str(resp_body) if resp_body is not None else ""})
-        except Exception:
-            self._send_json(resp_code, {"content": str(resp_body) if resp_body is not None else ""})
+        if resp_code >= 400:
+            if isinstance(resp_body, dict):
+                self._send_json(resp_code, resp_body)
+            else:
+                self._send_json(resp_code, {"error": {"message": str(resp_body), "type": "upstream_error"}})
+        else:
+            try:
+                if isinstance(resp_body, dict) and "choices" in resp_body:
+                    return self._chat_to_responses(resp_body)
+                self._send_json(resp_code, resp_body if isinstance(resp_body, dict) else {"content": str(resp_body) if resp_body is not None else ""})
+            except Exception:
+                self._send_json(resp_code, {"content": str(resp_body) if resp_body is not None else ""})
 
     def _handle_anthropic_messages_as_chat(self) -> None:
         """把 Anthropic /v1/messages 请求转成 OpenAI chat.completions，再把响应转回来。"""
@@ -1632,6 +1894,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._send_json(502, {"error": {"message": f"upstream error: {e}", "type": "upstream_error"}})
             return
 
+        # token 计数（不会因此中断请求）
+        try:
+            self._count_response_tokens(resp_body, bytes(resp_body) if isinstance(resp_body, (bytes, bytearray)) else None)
+        except Exception:
+            pass
+
         if stream and isinstance(resp_body, (bytes, bytearray)):
             try:
                 self.send_response(resp_code)
@@ -1646,12 +1914,19 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self.state.emit("❌", f"stream 写回失败: {e}")
                 return
 
-        try:
-            if isinstance(resp_body, dict) and "choices" in resp_body:
-                return self._chat_to_anthropic(resp_body, payload)
-            self._send_json(resp_code, {"content": str(resp_body) if resp_body is not None else ""})
-        except Exception:
-            self._send_json(resp_code, {"content": str(resp_body) if resp_body is not None else ""})
+        if resp_code >= 400:
+            # 错误响应：原样透传上游错误，不包装
+            if isinstance(resp_body, dict):
+                self._send_json(resp_code, resp_body)
+            else:
+                self._send_json(resp_code, {"error": {"message": str(resp_body), "type": "upstream_error"}})
+        else:
+            try:
+                if isinstance(resp_body, dict) and "choices" in resp_body:
+                    return self._chat_to_anthropic(resp_body, payload)
+                self._send_json(resp_code, {"content": str(resp_body) if resp_body is not None else ""})
+            except Exception:
+                self._send_json(resp_code, {"content": str(resp_body) if resp_body is not None else ""})
 
     # ---------------- payload 转换工具 ----------------
     @staticmethod
@@ -1684,8 +1959,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         p.pop("tool_choice", None)
         return p
 
-    @staticmethod
-    def _chat_to_responses(chat_resp: Dict[str, Any]) -> None:
+    def _chat_to_responses(self, chat_resp: Dict[str, Any]) -> None:
         """把 chat.completions 响应再包装成 responses 格式写回。"""
         try:
             import time as _t
@@ -1730,9 +2004,18 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _anthropic_to_chat(payload: Dict[str, Any]) -> Dict[str, Any]:
-        """Anthropic /v1/messages -> OpenAI chat.completions。"""
+        """Anthropic /v1/messages -> OpenAI chat.completions。
+
+        保留 system prompt（转成 system 角色消息），透传 stream 等字段。
+        """
         p = dict(payload)
         msgs = []
+
+        # Anthropic 顶级 system 字段 → 转为 system 角色消息
+        system_text = p.pop("system", None)
+        if system_text and isinstance(system_text, str):
+            msgs.append({"role": "system", "content": system_text})
+
         for m in p.get("messages", []) or []:
             if isinstance(m, dict):
                 role = m.get("role", "user")
@@ -1743,15 +2026,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     )
                     content = text
                 msgs.append({"role": role, "content": str(content)})
+
         chat = {"model": p.get("model", ""), "messages": msgs}
         if p.get("max_tokens"):
             chat["max_tokens"] = p["max_tokens"]
-        chat.pop("system", None)
-        chat.pop("tools", None)
+        if "stream" in p:
+            chat["stream"] = bool(p["stream"])
         return chat
 
-    @staticmethod
-    def _chat_to_anthropic(chat_resp: Dict[str, Any], req_payload: Dict[str, Any]) -> None:
+    def _chat_to_anthropic(self, chat_resp: Dict[str, Any], req_payload: Dict[str, Any]) -> None:
         """把 chat.completions 响应包装成 Anthropic /v1/messages 响应写回。"""
         try:
             import time as _t
@@ -1800,6 +2083,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
         obj.wfile.write(body)
 
 
+    @staticmethod
+    def _create_ssl_context() -> ssl.SSLContext:
+        """创建兼容性更好的 SSL 上下文，解决 Windows 环境下的证书验证问题。"""
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = True
+        ctx.verify_mode = ssl.CERT_REQUIRED
+        return ctx
+
     def _do_upstream(
         self,
         provider: Provider,
@@ -1820,52 +2111,74 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 "Authorization": f"Bearer {provider.api_key}",
                 "Content-Type": "application/json",
                 "Accept": "text/event-stream" if stream else "application/json",
-                "User-Agent": "ccswith-proxy/1.0",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ccswith-proxy/1.0",
             },
         )
-        try:
-            with urllib.request.urlopen(req, timeout=300 if stream else 120) as resp:
-                resp_code = resp.getcode() or 200
-                resp_headers = {k.lower(): v for k, v in resp.headers.items()}
-                # 流式：原样 chunk 透传
-                if stream:
-                    self.state.emit("📊", f"收到上游 stream 响应 code={resp_code}，开始透传 chunks")
-                    # 读取全部并原样作为 bytes 返回（调用方会直接写回客户端）
-                    raw = resp.read()
-                    self.state.emit("📊", f"stream 转发完成，共 {len(raw)} 字节")
-                    return raw, resp_headers, resp_code
-                # 非流式：按 JSON 解析，失败则保留文本
-                raw = resp.read().decode("utf-8", errors="replace")
-                self.state.emit("📊", f"上游响应 code={resp_code} 长度={len(raw)}")
-                parsed: Any = raw
-                if raw:
-                    try:
-                        parsed = json.loads(raw)
-                    except Exception:
-                        parsed = raw
-                return parsed, resp_headers, resp_code
-        except urllib.error.HTTPError as e:
-            code = e.code or 502
+
+        # 重试配置：最多重试 2 次（共 3 次尝试），指数退避
+        max_attempts = 3
+        base_delay = 1.0
+        last_exception: Optional[Exception] = None
+
+        for attempt in range(1, max_attempts + 1):
             try:
-                body_raw = e.read()
-                body_text = body_raw.decode("utf-8", errors="replace")
-            except Exception:
-                body_raw = b""
-                body_text = ""
-            self.state.emit("❌", f"上游 HTTP 错误 code={code}  body={body_text[:400]}")
-            # 如果是流式请求，错误也按原样 bytes 返回
-            if stream:
-                return body_raw, {}, code
-            parsed: Any = body_text
-            if body_text:
+                ssl_ctx = self._create_ssl_context()
+                with urllib.request.urlopen(req, timeout=300 if stream else 120, context=ssl_ctx) as resp:
+                    resp_code = resp.getcode() or 200
+                    resp_headers = {k.lower(): v for k, v in resp.headers.items()}
+                    if stream:
+                        self.state.emit("📊", f"收到上游 stream 响应 code={resp_code}，开始透传 chunks")
+                        raw = resp.read()
+                        self.state.emit("📊", f"stream 转发完成，共 {len(raw)} 字节")
+                        return raw, resp_headers, resp_code
+                    raw = resp.read().decode("utf-8", errors="replace")
+                    self.state.emit("📊", f"上游响应 code={resp_code} 长度={len(raw)}")
+                    parsed: Any = raw
+                    if raw:
+                        try:
+                            parsed = json.loads(raw)
+                        except Exception:
+                            parsed = raw
+                    return parsed, resp_headers, resp_code
+            except urllib.error.HTTPError as e:
+                code = e.code or 502
                 try:
-                    parsed = json.loads(body_text)
+                    body_raw = e.read()
+                    body_text = body_raw.decode("utf-8", errors="replace")
                 except Exception:
-                    parsed = body_text
-            return parsed, {}, code
-        except Exception as e:
-            self.state.emit("❌", f"上游请求异常: {type(e).__name__}: {e}")
-            raise
+                    body_raw = b""
+                    body_text = ""
+                self.state.emit("❌", f"上游 HTTP 错误 code={code}  body={body_text[:400]}")
+                # 429（限流）和 5xx（服务端错误）可重试
+                retryable = (code == 429 or code >= 500) and attempt < max_attempts
+                if retryable:
+                    delay = base_delay * (2 ** (attempt - 1))
+                    self.state.emit("⚠️", f"HTTP {code} 将在 {delay:.1f}s 后重试 ({attempt}/{max_attempts})")
+                    time.sleep(delay)
+                    continue
+                if stream:
+                    return body_raw, {}, code
+                parsed: Any = body_text
+                if body_text:
+                    try:
+                        parsed = json.loads(body_text)
+                    except Exception:
+                        parsed = body_text
+                return parsed, {}, code
+            except (urllib.error.URLError, socket.timeout, OSError) as e:
+                last_exception = e
+                # 网络级错误可重试
+                if attempt < max_attempts:
+                    delay = base_delay * (2 ** (attempt - 1))
+                    self.state.emit("⚠️", f"连接异常 {type(e).__name__} 将在 {delay:.1f}s 后重试 ({attempt}/{max_attempts})")
+                    time.sleep(delay)
+                    continue
+                self.state.emit("❌", f"上游请求异常（已重试 {max_attempts} 次）: {type(e).__name__}: {e}")
+                raise
+            except Exception as e:
+                # 非网络类异常不重试，立即抛出
+                self.state.emit("❌", f"上游请求异常: {type(e).__name__}: {e}")
+                raise
 
 
 def create_proxy_http_server(host: str, port: int, state: ProxyState) -> ThreadingHTTPServer:

@@ -6,10 +6,14 @@ ccswith.gui - CC-Switch Python 图形界面 (CustomTkinter)
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import json
 import logging
 import os
+import secrets
 import socket
+import string
 import threading
 import tkinter as tk
 import tkinter.colorchooser
@@ -593,13 +597,8 @@ class App(ctk.CTk):
         self.title(APP_TITLE)
         self.geometry("1200x760")
         self.minsize(960, 600)
-        try:
-            self.state("zoomed")
-        except Exception:
-            try:
-                self.attributes("-fullscreen", True)
-            except Exception:
-                pass
+        # 延迟最大化，确保窗口完全初始化后再执行
+        self.after(50, self._maximize_window)
 
         # 图标（Windows）
         try:
@@ -627,6 +626,16 @@ class App(ctk.CTk):
 
         # 自动启动 API 网关代理（使用 config.yaml 里 proxy 分区的 host/port/virtual_model）
         self._auto_start_proxy()
+
+    def _maximize_window(self) -> None:
+        """窗口最大化，延迟调用确保在窗口完全初始化后生效。"""
+        try:
+            self.state("zoomed")
+        except Exception:
+            try:
+                self.attributes("-fullscreen", True)
+            except Exception:
+                pass
 
     # ----------------------- 设置读写（统一由 ProviderManager 写 config.yaml） -----------------------
     def _load_settings(self) -> dict:
@@ -698,6 +707,11 @@ class App(ctk.CTk):
             if w is not None:
                 try:
                     w.configure(fg_color=self.skin_body)
+                    for child in w.winfo_children():
+                        try:
+                            child.configure(fg_color=self.skin_body)
+                        except Exception:
+                            pass
                 except Exception:
                     pass
 
@@ -865,6 +879,8 @@ class App(ctk.CTk):
         self.current_lbl.pack(side="left", padx=8)
         self.status_led = tk.Label(head, text="●", fg="#95a5a6", font=("Arial", 16))
         self.status_led.pack(side="left", padx=4)
+        self.token_lbl = ctk.CTkLabel(head, text="", text_color="#6A1B9A", font=(self.settings.get("font_family","微软雅黑"), 11))
+        self.token_lbl.pack(side="left", padx=12)
 
         # 服务商下拉选择
         pick_row = ctk.CTkFrame(self._center, fg_color=self.skin_body)
@@ -872,6 +888,10 @@ class App(ctk.CTk):
         ctk.CTkLabel(pick_row, text="📋 选择要切换的服务商", text_color=TAG_TEXT).pack(side="left")
         self.provider_combo = ctk.CTkComboBox(pick_row, values=[], width=300, fg_color=TEXT_BG, text_color=INPUT_FG)
         self.provider_combo.pack(side="left", padx=6)
+        try:
+            self.provider_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_combo_selected())
+        except Exception:
+            pass
         self.auto_backup = tk.BooleanVar(value=True)
         ctk.CTkCheckBox(
             pick_row,
@@ -1019,7 +1039,7 @@ class App(ctk.CTk):
         # 读取之前保存的勾选状态；如果没保存过，默认全勾选
         saved_clis = self.settings.get("enabled_clis") if isinstance(self.settings, dict) else None
         if not isinstance(saved_clis, list) or not saved_clis:
-            saved_clis = list(CLI_TEMPLATES.keys())  # 首次启动全选
+            saved_clis = []  # 首次启动默认不勾选任何 CLI
         saved_set = {str(k) for k in saved_clis}
         # 自己维护一份勾选状态（避免依赖 CTkCheckBox 内部状态和 BooleanVar 绑定）
         self.cli_selected = {k: (k in saved_set) for k in CLI_TEMPLATES.keys()}
@@ -1069,6 +1089,114 @@ class App(ctk.CTk):
                 pass
             self.cli_chks[key] = chk
             chk.pack(side="left", padx=6)
+
+        # 代理 API Key 管理
+        key_box = ctk.CTkFrame(self._center, fg_color=self.skin_body)
+        key_box.pack(fill="x", padx=10, pady=6)
+        ctk.CTkLabel(key_box, text="🔑 代理 API Key", text_color=TAG_TEXT).pack(side="left")
+
+        # 从 config.yaml 里的 proxy.api_key 读取（用 manager 原生的 get_proxy_settings，不走 self.settings）
+        saved_key = ""
+        try:
+            proxy_cfg = self.engine.manager.get_proxy_settings() or {}
+            if isinstance(proxy_cfg, dict):
+                saved_key = str(proxy_cfg.get("api_key", "") or "")
+        except Exception:
+            saved_key = ""
+        self.proxy_key_var = tk.StringVar(value=saved_key)
+
+        self.key_entry = ctk.CTkEntry(
+            key_box,
+            width=300,
+            textvariable=self.proxy_key_var,
+            fg_color=TEXT_BG,
+            text_color=OUTPUT_FG,
+            placeholder_text="（未设置，外部 Agent 连代理无需鉴权）",
+        )
+        self.key_entry.pack(side="left", padx=6, ipady=2)
+
+        def _on_gen():
+            """生成真实风格的 sk- 前缀 key（43 字符字母数字，大小写混合）。"""
+            import random as _r
+            alphabet = string.ascii_letters + string.digits
+            new_key = "sk-" + "".join(_r.choice(alphabet) for _ in range(43))
+            self.proxy_key_var.set(new_key)
+            self.key_entry.icursor(tk.END)
+            self._toast("ℹ️ 已生成 Key，点击 💾 保存")
+
+        def _on_save():
+            """把当前输入框里的 Key 保存到 config.yaml。"""
+            self._save_proxy_key()
+            val = (self.proxy_key_var.get() or "").strip()
+            if val:
+                self._toast("✅ 代理 API Key 已保存")
+            else:
+                self._toast("✅ 代理 API Key 已清除并保存")
+
+        def _on_copy():
+            """复制输入框里的 key 到剪贴板。"""
+            val = (self.proxy_key_var.get() or "").strip()
+            if not val:
+                self._toast("❌ 没有可复制的 Key")
+                return
+            try:
+                self.clipboard_clear()
+                self.clipboard_append(val)
+                self.update()
+                self._toast("✅ 已复制代理 API Key 到剪贴板")
+            except Exception as e:
+                self._toast(f"❌ 复制失败: {e}")
+
+        def _on_del():
+            """清除 key（同时保存空值到 config.yaml）。"""
+            self.proxy_key_var.set("")
+            self.key_entry.delete(0, tk.END)
+            self._save_proxy_key()
+            self._toast("✅ 已清除代理 API Key（代理不再鉴权）")
+
+        key_gen = ctk.CTkButton(
+            key_box,
+            text="🔑 生成",
+            fg_color=BUTTON_PRIMARY,
+            hover_color=BUTTON_SECONDARY,
+            text_color="#FFFFFF",
+            width=80,
+            command=_on_gen,
+        )
+        key_gen.pack(side="left", padx=4)
+
+        key_save = ctk.CTkButton(
+            key_box,
+            text="� 保存",
+            fg_color=BUTTON_SECONDARY,
+            hover_color=BUTTON_PRIMARY,
+            text_color="#FFFFFF",
+            width=80,
+            command=_on_save,
+        )
+        key_save.pack(side="left", padx=4)
+
+        key_copy = ctk.CTkButton(
+            key_box,
+            text="📋 复制",
+            fg_color=BUTTON_PRIMARY,
+            hover_color=BUTTON_SECONDARY,
+            text_color="#FFFFFF",
+            width=80,
+            command=_on_copy,
+        )
+        key_copy.pack(side="left", padx=4)
+
+        key_del = ctk.CTkButton(
+            key_box,
+            text="❌ 删除",
+            fg_color=BUTTON_SECONDARY,
+            hover_color=BUTTON_PRIMARY,
+            text_color="#FFFFFF",
+            width=80,
+            command=_on_del,
+        )
+        key_del.pack(side="left", padx=4)
 
         # 切换结果显示
         res_box = ctk.CTkFrame(self._center, fg_color=self.skin_body)
@@ -1146,11 +1274,47 @@ class App(ctk.CTk):
         self.log_text.pack(fill="both", expand=True)
 
     def _build_bottom(self) -> None:
-        self._bottom = ctk.CTkFrame(self, fg_color=self.skin_body, height=26)
+        self._bottom = ctk.CTkFrame(self, fg_color=self.skin_body)
         self._bottom.pack(fill="x", side="bottom")
         self._bottom.pack_propagate(False)
-        # 进度条 + 状态文本
-        self.progress = ttk.Progressbar(self._bottom, mode="determinate", length=260)
+
+        # 日志区
+        log_frame = ctk.CTkFrame(self._bottom, fg_color=self.skin_body)
+        log_frame.pack(fill="both", expand=True, padx=4, pady=(2, 0))
+
+        # 按钮行
+        btn_row = ctk.CTkFrame(log_frame, fg_color=self.skin_body)
+        btn_row.pack(fill="x")
+        ctk.CTkLabel(btn_row, text="📋 实时日志", text_color=TAG_TEXT,
+            font=(self.settings.get("font_family", "微软雅黑"), 11, "bold")).pack(side="left")
+        ctk.CTkButton(btn_row, text="🗑️ 清空", width=80,
+            fg_color=BUTTON_PRIMARY, hover_color=BUTTON_SECONDARY,
+            text_color="#FFFFFF", command=self.clear_log).pack(side="right", padx=2)
+        ctk.CTkButton(btn_row, text="📋 复制", width=80,
+            fg_color=BUTTON_SECONDARY, hover_color=BUTTON_PRIMARY,
+            text_color="#FFFFFF", command=self.copy_log).pack(side="right", padx=2)
+
+        # 日志文本框
+        lf = ctk.CTkFrame(log_frame, fg_color=self.skin_body)
+        lf.pack(fill="both", expand=True, pady=(2, 0))
+        self.log_text = ctk.CTkTextbox(lf, fg_color="#FFFFFF", text_color="#008080",
+            corner_radius=4, wrap="word", height=140)
+        try:
+            self.log_text.tag_config("ts", foreground="#D8BFD8")
+            self.log_text.tag_config("ok", foreground="#008080")
+            self.log_text.tag_config("err", foreground="#C62828")
+            self.log_text.tag_config("info", foreground="#1565C0")
+            self.log_text.tag_config("data", foreground="#6A1B9A")
+            self.log_text.tag_config("msg", foreground="#00695C")
+        except Exception:
+            pass
+        self.log_text.pack(fill="both", expand=True)
+
+        # 进度条行
+        prog_row = ctk.CTkFrame(self._bottom, fg_color=self.skin_body, height=26)
+        prog_row.pack(fill="x")
+        prog_row.pack_propagate(False)
+        self.progress = ttk.Progressbar(prog_row, mode="determinate", length=260)
         self.progress.pack(side="right", padx=6, pady=3)
         try:
             style = ttk.Style()
@@ -1159,7 +1323,7 @@ class App(ctk.CTk):
             self.progress.configure(style="CCSwitch.Horizontal.TProgressbar")
         except Exception:
             pass
-        ctk.CTkLabel(self._bottom, textvariable=self.progress_text, text_color=TAG_TEXT).pack(side="left", padx=8)
+        ctk.CTkLabel(prog_row, textvariable=self.progress_text, text_color=TAG_TEXT).pack(side="left", padx=8)
 
     def _build_context_menu(self) -> None:
         menu = tk.Menu(self, tearoff=0)
@@ -1238,33 +1402,52 @@ class App(ctk.CTk):
 
     # ----------------------- 提示 / 悬浮 -----------------------
     def _bind_tooltip(self, widget, text: str) -> None:
-        tip = {"win": None, "job": None}
+        # 用独立的闭包变量，彻底避免 leave/show_tip 对同一个 dict 字段的竞争访问
+        state = {"job": None}
+        win_holder = {"toplevel": None}
+
+        def _cancel_job():
+            if state["job"] is not None:
+                try:
+                    self.after_cancel(state["job"])
+                finally:
+                    state["job"] = None
+
+        def _close_tip():
+            top = win_holder["toplevel"]
+            if top is not None:
+                try:
+                    if top.winfo_exists():
+                        top.destroy()
+                except Exception:
+                    pass
+                finally:
+                    win_holder["toplevel"] = None
 
         def enter(_e):
-            if tip["job"]:
-                self.after_cancel(tip["job"])
-            tip["job"] = self.after(500, lambda: self._show_tip(widget, text, tip))
+            _cancel_job()
+            win_holder["toplevel"] = None
+            state["job"] = self.after(500, lambda: self._show_tip(widget, text, win_holder))
 
         def leave(_e):
-            if tip["job"]:
-                self.after_cancel(tip["job"])
-                tip["job"] = None
-            if tip["win"]:
-                try:
-                    tip["win"].destroy()
-                finally:
-                    tip["win"] = None
+            _cancel_job()
+            _close_tip()
 
         widget.bind("<Enter>", enter)
         widget.bind("<Leave>", leave)
 
-    def _show_tip(self, widget, text: str, tip: dict) -> None:
-        if tip["win"] is not None:
+    def _show_tip(self, widget, text: str, win_holder: dict) -> None:
+        if win_holder.get("toplevel") is not None:
             return
         try:
+            if not widget.winfo_exists():
+                return
             win = tk.Toplevel(widget)
             win.overrideredirect(True)
-            win.attributes("-topmost", True)
+            try:
+                win.attributes("-topmost", True)
+            except Exception:
+                pass
             tk.Label(
                 win,
                 text=text,
@@ -1277,21 +1460,30 @@ class App(ctk.CTk):
                 borderwidth=1,
             ).pack()
             win.update_idletasks()
-            mx = widget.winfo_rootx()
-            my = widget.winfo_rooty() + widget.winfo_height() + 4
-            w = win.winfo_width()
-            # 防止超出屏幕
             try:
+                mx = widget.winfo_rootx()
+                my = widget.winfo_rooty() + widget.winfo_height() + 4
+                w = win.winfo_width()
                 sw = self.winfo_screenwidth()
                 if mx + w > sw:
                     mx = sw - w - 10
+                win.geometry(f"+{max(mx,0)}+{max(my,0)}")
             except Exception:
                 pass
-            win.geometry(f"+{max(mx,0)}+{max(my,0)}")
-            tip["win"] = win
-            win.after(3000, lambda: (win.destroy(), tip.pop("win", None)))
+            win_holder["toplevel"] = win
+
+            def _auto_close():
+                if win_holder.get("toplevel") is win:
+                    try:
+                        if win.winfo_exists():
+                            win.destroy()
+                    except Exception:
+                        pass
+                    win_holder["toplevel"] = None
+
+            win.after(3000, _auto_close)
         except Exception:
-            pass
+            win_holder["toplevel"] = None
 
     # ----------------------- 服务商列表 -----------------------
     def refresh_provider_list(self) -> None:
@@ -1486,17 +1678,17 @@ class App(ctk.CTk):
     def _make_logger_cb(self) -> Callable[[str, str], None]:
         """返回一个线程安全的回调：把代理日志塞回 GUI 日志区。"""
         def _cb(icon: str, msg: str) -> None:
-            # 从子线程回到主线程追加日志
             try:
                 self.after(0, lambda: self._log(icon, msg))
+                # token 日志触发用量显示刷新
+                if msg.startswith("tokens:"):
+                    self.after(0, self._update_token_display)
             except Exception:
-                # 窗口可能已销毁，忽略
                 pass
         return _cb
 
     def _auto_start_proxy(self) -> None:
         """GUI 启动后自动起代理（读取 config.yaml proxy 分区）。"""
-        # 用 after 让窗口先渲染出来再起代理
         def task():
             try:
                 provider = self.engine.manager.get_current()
@@ -1515,54 +1707,21 @@ class App(ctk.CTk):
                     or HERMES_VIRTUAL_MODEL
                 ).strip() or HERMES_VIRTUAL_MODEL
 
-                # 如果用户之前改过 host/port/virtual 的输入框但没保存 proxy 分区，
-                # 以 UI 输入框为准
-                try:
-                    h = self._proxy_host_entry.get().strip()
-                    if h:
-                        host = h
-                except Exception:
-                    pass
-                try:
-                    p_raw = self._proxy_port_entry.get().strip()
-                    if p_raw:
-                        port = int(p_raw)
-                except Exception:
-                    pass
-                try:
-                    v = self._proxy_vm_entry.get().strip()
-                    if v:
-                        virtual = v
-                except Exception:
-                    pass
-
                 # 端口被占用就找下一个
                 try:
                     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                     s.settimeout(0.5)
                     s.connect((host, port))
                     s.close()
-                    # 端口已被占用 → 换一个
                     port = pick_free_port(host, start=port + 1)
-                    self.after(0, lambda: self._log("ℹ️", f"端口被占用，改用 {port}"))
+                    self.after(0, lambda p=port: self._log("ℹ️", f"端口被占用，改用 {p}"))
                 except OSError:
                     pass
                 except Exception:
                     pass
 
-                # 写回 UI 输入框
-                self.proxy_host_var.set(host)
-                self.proxy_port_var.set(str(port))
-                self.virtual_model_var.set(virtual)
-                try:
-                    self._proxy_host_entry.delete(0, tk.END)
-                    self._proxy_host_entry.insert(0, host)
-                    self._proxy_port_entry.delete(0, tk.END)
-                    self._proxy_port_entry.insert(0, str(port))
-                    self._proxy_vm_entry.delete(0, tk.END)
-                    self._proxy_vm_entry.insert(0, virtual)
-                except Exception:
-                    pass
+                # 写回 UI 输入框（必须在主线程执行）
+                self.after(0, lambda h=host, p=port, v=virtual: self._apply_proxy_ui(h, p, v))
 
                 # 启动
                 state = ProxyState(self.engine.manager)
@@ -1587,22 +1746,38 @@ class App(ctk.CTk):
                 except Exception:
                     pass
                 self.after(0, self._update_proxy_label)
+                self.after(0, self._update_token_display)
                 self.after(
                     0,
-                    lambda: self._log(
+                    lambda h=host, p=port, v=virtual, d=provider.display_name: self._log(
                         "✅",
-                        f"API 网关已启动 http://{host}:{port}/v1  虚拟模型={virtual}  当前服务商={provider.display_name}",
+                        f"API 网关已启动 http://{h}:{p}/v1  虚拟模型={v}  当前服务商={d}",
                     ),
                 )
-                FloatingToast(
+                self.after(0, lambda h=host, p=port: FloatingToast(
                     self,
-                    f"✅ API 网关已启动 http://{host}:{port}/v1",
+                    f"✅ API 网关已启动 http://{h}:{p}/v1",
                     ok=True,
-                )
+                ))
             except Exception as e:
-                self.after(0, lambda: self._log("❌", f"自动启动 API 网关失败: {e}"))
+                self.after(0, lambda e=e: self._log("❌", f"自动启动 API 网关失败: {e}"))
 
         self._run_async(task)
+
+    def _apply_proxy_ui(self, host: str, port: int, virtual: str) -> None:
+        """在主线程更新代理 UI 输入框的值。"""
+        try:
+            self.proxy_host_var.set(host)
+            self.proxy_port_var.set(str(port))
+            self.virtual_model_var.set(virtual)
+            self._proxy_host_entry.delete(0, tk.END)
+            self._proxy_host_entry.insert(0, host)
+            self._proxy_port_entry.delete(0, tk.END)
+            self._proxy_port_entry.insert(0, str(port))
+            self._proxy_vm_entry.delete(0, tk.END)
+            self._proxy_vm_entry.insert(0, virtual)
+        except Exception:
+            pass
 
     def on_stop_proxy(self) -> None:
         """停止代理。"""
@@ -1623,6 +1798,7 @@ class App(ctk.CTk):
             FloatingToast(self, "✅ API 网关已停止", ok=True)
             self._log_status(True, "API 网关已停止")
             self._update_proxy_label()
+            self._update_token_display()
         except Exception as e:
             FloatingToast(self, f"❌ 停止失败: {e}", ok=False)
 
@@ -1704,6 +1880,59 @@ class App(ctk.CTk):
         """任何一个目标 CLI 勾选改变都立即写 config.yaml。"""
         self._save_enabled_clis()
 
+    def _on_combo_selected(self) -> None:
+        """服务商下拉切换后立即生效（更新 current + 刷新列表）。"""
+        alias = (self.provider_combo.get() or "").strip()
+        if not alias:
+            return
+        try:
+            ok = self.engine.manager.set_current(alias)
+            if ok:
+                self._toast(f"✅ 已切换当前服务商: {alias}")
+            else:
+                self._toast(f"❌ 切换失败: 找不到 {alias}")
+        except Exception as e:
+            self._toast(f"❌ 切换失败: {e}")
+            return
+        try:
+            self.refresh_provider_list()
+        except Exception:
+            pass
+
+    def _save_proxy_key(self) -> None:
+        """把代理 API Key 保存到 config.yaml（proxy.api_key）。"""
+        try:
+            key = (self.proxy_key_var.get() if hasattr(self, "proxy_key_var") else "") or ""
+            key = key.strip()
+            # 用 manager 原生的 set_proxy_settings，不自己拼 settings 结构
+            cur = self.engine.manager.get_proxy_settings() or {}
+            cur = dict(cur)
+            cur["api_key"] = key
+            self.engine.manager.set_proxy_settings(cur)
+            # 同步到 ui_settings 一份（兼容旧逻辑）
+            try:
+                ui = self.engine.manager.get_ui_settings() or {}
+                ui["proxy_api_key"] = key
+                self.engine.manager.set_ui_settings(ui)
+            except Exception:
+                pass
+        except Exception as e:
+            try:
+                FloatingToast(self, f"❌ 保存 Key 失败: {e}", ok=False)
+            except Exception:
+                pass
+
+    def _toast(self, text: str) -> None:
+        """1 秒悬浮提示。"""
+        ok = not text.startswith("❌")
+        try:
+            FloatingToast(self, text, ok=ok)
+        except Exception:
+            try:
+                self._log("ℹ️" if ok else "❌", text)
+            except Exception:
+                pass
+
     def _on_close_and_save(self) -> None:
         """关窗口时必存所有 UI 设置（代理地址 + 目标 CLI 勾选 + 外观）。"""
         try:
@@ -1770,6 +1999,18 @@ class App(ctk.CTk):
             txt = f"http://{host}:{port}/v1  (未启动)" if not getattr(self, "_proxy_httpd", None) else f"http://{host}:{port}/v1  (运行中)"
             color = "#2ECC71" if getattr(self, "_proxy_httpd", None) else "#C62828"
             self.proxy_addr_lbl.configure(text=txt, text_color=color)
+        except Exception:
+            pass
+
+    def _update_token_display(self) -> None:
+        """刷新 token 用量显示。"""
+        try:
+            state = getattr(self, "_proxy_state", None)
+            if state:
+                summary = state.get_token_summary()
+                self.token_lbl.configure(text=summary)
+            else:
+                self.token_lbl.configure(text="")
         except Exception:
             pass
 
@@ -1852,26 +2093,29 @@ class App(ctk.CTk):
                     body = e.read().decode("utf-8", errors="replace")[:300]
                 except Exception:
                     body = ""
+                err_code = getattr(e, "code", "?")
                 self.after(
                     0,
                     lambda: self._log(
                         "❌",
-                        f"服务商 {p.display_name} 失败 HTTP {e.code} upstream={upstream}  耗时={dt}ms  body={body}",
+                        f"服务商 {p.display_name} 失败 HTTP {err_code} upstream={upstream}  耗时={dt}ms  body={body}",
                     ),
                 )
-                self.after(0, lambda: self.set_progress(f"HTTP {e.code}", 3, 3))
-                self.after(0, lambda: FloatingToast(self, f"❌ HTTP {e.code}", ok=False))
+                self.after(0, lambda: self.set_progress(f"HTTP {err_code}", 3, 3))
+                self.after(0, lambda: FloatingToast(self, f"❌ HTTP {err_code}", ok=False))
             except Exception as e:
                 dt = int((_time.time() - t0) * 1000)
+                err_name = type(e).__name__
+                err_msg = str(e)[:120]
                 self.after(
                     0,
                     lambda: self._log(
                         "❌",
-                        f"服务商 {p.display_name} 失败: {type(e).__name__}: {e}  upstream={upstream}  耗时={dt}ms",
+                        f"服务商 {p.display_name} 失败: {err_name}: {err_msg}  upstream={upstream}  耗时={dt}ms",
                     ),
                 )
                 self.after(0, lambda: self.set_progress(f"测试失败", 3, 3))
-                self.after(0, lambda: FloatingToast(self, f"❌ {type(e).__name__}", ok=False))
+                self.after(0, lambda: FloatingToast(self, f"❌ {err_name}", ok=False))
 
         self._run_async(task)
 
@@ -1952,6 +2196,7 @@ class App(ctk.CTk):
                             except Exception:
                                 pass
                             self.after(0, self._update_proxy_label)
+                            self.after(0, self._update_token_display)
                             self.after(0, lambda: self._log("✅", f"API 网关已启动 {proxy_url}  虚拟模型={virtual}"))
                             FloatingToast(self, f"✅ API 网关已启动 {proxy_url}", ok=True)
                         except Exception as e:
@@ -1987,9 +2232,10 @@ class App(ctk.CTk):
             FloatingToast(self, "ℹ️ API 网关已在运行", ok=True)
             return
 
+        host, port, _ = self._proxy_url()
+        virtual = (self.virtual_model_var.get() or HERMES_VIRTUAL_MODEL).strip() or HERMES_VIRTUAL_MODEL
+
         def task():
-            host, port, _ = self._proxy_url()
-            virtual = (self.virtual_model_var.get() or HERMES_VIRTUAL_MODEL).strip() or HERMES_VIRTUAL_MODEL
             try:
                 state = ProxyState(self.engine.manager)
                 state.set_virtual_model(virtual)
@@ -2010,8 +2256,9 @@ class App(ctk.CTk):
                 except Exception:
                     pass
                 self.after(0, self._update_proxy_label)
-                self.after(0, lambda: self._log("✅", f"API 网关已启动 http://{host}:{port}/v1  虚拟模型={virtual}"))
-                FloatingToast(self, f"✅ API 网关已启动 http://{host}:{port}/v1", ok=True)
+                self.after(0, self._update_token_display)
+                self.after(0, lambda h=host, p=port, v=virtual: self._log("✅", f"API 网关已启动 http://{h}:{p}/v1  虚拟模型={v}"))
+                self.after(0, lambda h=host, p=port: FloatingToast(self, f"✅ API 网关已启动 http://{h}:{p}/v1", ok=True))
             except Exception as e:
                 self.after(0, lambda: self._log("❌", f"启动 API 网关失败: {e}"))
 
@@ -2099,10 +2346,10 @@ class App(ctk.CTk):
                         f"\n--- 代理测试 ---\n{url}  code={code}\n回复: {text or str(parsed)[:200]}\n",
                     ),
                 )
-                FloatingToast(self, f"✅ 测试通过 code={code}", ok=True)
+                self.after(0, lambda c=code: FloatingToast(self, f"✅ 测试通过 code={c}", ok=True))
             except Exception as e:
-                self.after(0, lambda: self._log("❌", f"代理测试失败: {e}"))
-                FloatingToast(self, f"❌ 测试失败: {e}", ok=False)
+                self.after(0, lambda e=e: self._log("❌", f"代理测试失败: {e}"))
+                self.after(0, lambda e=e: FloatingToast(self, f"❌ 测试失败: {e}", ok=False))
             finally:
                 try:
                     httpd.shutdown()

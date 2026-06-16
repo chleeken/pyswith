@@ -7,6 +7,7 @@ config/config.yaml
 
 # 不排除 config.example.yaml（公共模板）
 # config/*.yaml
+config/token_usage.json
 
 .env
 *.env
