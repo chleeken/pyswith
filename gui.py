@@ -1762,7 +1762,8 @@ class App(ctk.CTk):
             except Exception as e:
                 self.after(0, lambda e=e: self._log("❌", f"自动启动 API 网关失败: {e}"))
 
-        self._run_async(task)
+        # 用主线程执行任务（socket 检查仅 0.5s 超时不会卡 UI）
+        self.after(200, task)
 
     def _apply_proxy_ui(self, host: str, port: int, virtual: str) -> None:
         """在主线程更新代理 UI 输入框的值。"""
@@ -2262,7 +2263,8 @@ class App(ctk.CTk):
             except Exception as e:
                 self.after(0, lambda: self._log("❌", f"启动 API 网关失败: {e}"))
 
-        self._run_async(task)
+        # 用主线程执行（无阻塞操作）
+        self.after(0, task)
 
     def on_switch_and_serve(self) -> None:
         alias = self.provider_combo.get().strip()

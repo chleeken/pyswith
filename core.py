@@ -20,6 +20,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -208,6 +209,7 @@ class ProviderManager:
     def __init__(self, config_dir: Optional[Path] = None):
         self.config_dir = ensure_dir(config_dir or get_config_dir())
         self.config_file = self.config_dir / self.CONFIG_FILE
+        self.env_file = self.config_dir / ".env"
         self.providers: Dict[str, Provider] = {}
         self.current_alias: Optional[str] = None
         self._raw: Dict[str, Any] = {}
@@ -223,17 +225,83 @@ class ProviderManager:
             logger.warning("config.yaml 读取失败: %s", e)
             return {}
         if isinstance(data, dict):
+            self._inject_env_keys(data)
             return data
         return {}
 
     def _write_config(self) -> None:
         try:
-            yaml_text = yaml_dump(self._raw)
+            data = deepcopy(self._raw)
+            self._strip_api_keys(data)
+            yaml_text = yaml_dump(data)
             with open(self.config_file, "w", encoding="utf-8") as f:
                 f.write(yaml_text if yaml_text.endswith("\n") else yaml_text + "\n")
         except Exception as e:
             logger.error("保存 config.yaml 失败: %s", e)
             raise
+
+    @staticmethod
+    def _strip_api_keys(data: Any) -> None:
+        """递归移除 dict 中的 api_key 字段（原地修改）。"""
+        if isinstance(data, dict):
+            data.pop("api_key", None)
+            for v in data.values():
+                ProviderManager._strip_api_keys(v)
+        elif isinstance(data, list):
+            for v in data:
+                ProviderManager._strip_api_keys(v)
+
+    # ----------------------- .env 密钥管理 -----------------------
+    def _load_env(self) -> Dict[str, str]:
+        """加载 config/.env 文件，返回 {KEY: VALUE} 字典。"""
+        if not self.env_file.exists():
+            return {}
+        result: Dict[str, str] = {}
+        try:
+            with open(self.env_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if "=" not in line:
+                        continue
+                    k, _, v = line.partition("=")
+                    result[k.strip()] = v.strip()
+        except Exception:
+            pass
+        return result
+
+    def _inject_env_keys(self, data: Dict[str, Any]) -> None:
+        """把 .env 中的 API keys 注入到 data（原地修改）。"""
+        env = self._load_env()
+        if not env:
+            return
+        providers = data.get("providers")
+        if isinstance(providers, dict):
+            for alias, p in providers.items():
+                if not isinstance(p, dict):
+                    continue
+                # 尝试精确匹配，再尝试规范化名（大写 + 特殊字符转 _）
+                val = env.get(alias) or env.get(re.sub(r'[^a-zA-Z0-9_]', '_', alias).upper())
+                if val:
+                    p["api_key"] = val
+        proxy = data.get("proxy")
+        if isinstance(proxy, dict):
+            for k in ("PROXY", "PROXY_API_KEY", "PROXY_KEY"):
+                if k in env:
+                    proxy["api_key"] = env[k]
+                    break
+
+    def _save_env_key(self, identifier: str, value: str) -> None:
+        """保存/更新一个 key 到 .env 文件。identifier 是别名或 PROXY。"""
+        env = self._load_env()
+        env[identifier] = value
+        lines = [f"{k}={v}\n" for k, v in sorted(env.items())]
+        try:
+            with open(self.env_file, "w", encoding="utf-8") as f:
+                f.writelines(lines)
+        except Exception as e:
+            logger.warning("保存 .env 失败: %s", e)
 
     # ----------------------- 迁移 -----------------------
     def _migrate_from_legacy_json(self) -> bool:
@@ -325,10 +393,13 @@ class ProviderManager:
 
     # ----------------------- 保存 -----------------------
     def save(self) -> None:
-        # 构造 providers 分区
+        # 构造 providers 分区，同时把 api_key 存到 .env
         providers_section: Dict[str, Any] = {}
         for alias, p in self.providers.items():
-            providers_section[alias] = {k: v for k, v in p.to_dict().items() if k != "alias"}
+            pd = {k: v for k, v in p.to_dict().items() if k != "alias"}
+            if pd.get("api_key"):
+                self._save_env_key(alias, pd["api_key"])
+            providers_section[alias] = pd
         self._raw["providers"] = providers_section
         if self.current_alias:
             self._raw["current_provider"] = self.current_alias
@@ -405,10 +476,23 @@ class ProviderManager:
 
     def get_proxy_settings(self) -> Dict[str, Any]:
         section = self._raw.get("proxy") if isinstance(self._raw, dict) else None
-        return dict(section) if isinstance(section, dict) else {}
+        result = dict(section) if isinstance(section, dict) else {}
+        # 从 .env 补回 api_key（config.yaml 不存 key）
+        if not result.get("api_key"):
+            env = self._load_env()
+            for k in ("PROXY", "PROXY_API_KEY", "PROXY_KEY"):
+                if k in env:
+                    result["api_key"] = env[k]
+                    break
+        return result
 
     def set_proxy_settings(self, settings: Dict[str, Any]) -> None:
-        self._raw["proxy"] = dict(settings)
+        settings = dict(settings)
+        # 需要保存的 api_key 写入 .env，不再进 config.yaml
+        key = settings.pop("api_key", None)
+        if key:
+            self._save_env_key("PROXY", key)
+        self._raw["proxy"] = settings
         self._write_config()
 
     # ----------------------- 导入/导出 JSON（服务商部分） -----------------------
