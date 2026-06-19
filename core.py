@@ -1566,6 +1566,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
             if p == "/v1/config":
                 self._handle_config()
                 return
+            # 视频状态轮询 GET /v1/videos/{id}
+            if p.startswith("/v1/videos/") or p.startswith("/videos/"):
+                self._handle_forward_get(p.lstrip("/v1").lstrip("/"))
+                return
             self._send_json(404, {"error": {"message": f"not found: {path}", "type": "not_found"}})
             return
 
@@ -1591,6 +1595,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # 兜底：按 path 前缀尝试 chat.completions
         if "chat/completions" in p:
             self._handle_chat_completions()
+            return
+
+        # 图片/视频生成端点（直接转发，不改写 payload）
+        if p in ("/v1/images/generations", "/images/generations"):
+            self._handle_forward("images/generations")
+            return
+        if p in ("/v1/video/generations", "/video/generations", "/v1/videos", "/videos"):
+            self._handle_forward("videos")
             return
 
         self._send_json(404, {"error": {"message": f"not found: {path}", "type": "not_found"}})
@@ -1708,19 +1720,44 @@ class ProxyHandler(BaseHTTPRequestHandler):
         避免重复拼接（例如智谱 base_url=https://open.bigmodel.cn/api/paas/v4/
         再拼 /v1/chat/completions 就变成 /v4/v1/chat/completions 404）。
 
-        规则：
-          - base 中已含 /v1、/v3、/v4 或 /v5 → 直接拼 action（不再加 /v1）
-          - 否则 → 拼 /v1/action（标准 OpenAI）
+        新逻辑：
+          1. 把 base 拆分为「版本前缀」和「额外路径」两部分
+          2. 若额外路径与 action 重复，去掉额外路径
+          3. 再拼 action
         """
         base = normalize_base_url(provider.base_url) or ""
         base = base.rstrip("/")
         action_clean = action.lstrip("/")
         version_prefixes = {"/v1", "/v3", "/v4", "/v5"}
-        if any(vp in base for vp in version_prefixes):
-            # 已含 API 版本前缀，直接拼 action
-            return base + "/" + action_clean
-        # 统一拼 /v1/action（OpenAI 标准）
-        return base + "/v1/" + action_clean
+
+        # 找到版本前缀在 base 中的位置
+        vp_pos = -1
+        for vp in version_prefixes:
+            pos = base.find(vp)
+            if pos != -1:
+                vp_pos = pos
+                break
+
+        if vp_pos == -1:
+            # 不含版本前缀 → 补上 /v1/action
+            return base + "/v1/" + action_clean
+
+        # 版本前缀长度均为 3（/v1、/v3、/v4、/v5）
+        PREFIX_LEN = 3
+        base_root = base[:vp_pos + PREFIX_LEN]
+        extra = base[vp_pos + PREFIX_LEN:].strip("/")
+
+        # 若额外路径已经是 action 的一部分，跳过
+        # 例如 base=.../v1/images/generations, action=images/generations → 直接用 base
+        if extra and extra == action_clean:
+            return base_root + "/" + extra
+
+        # 若额外路径包含在 action 中（如 extra=images/generations, action=chat/completions）
+        # 说明 base_url 填了具体端点 → 剥离 extra
+        if extra:
+            return base_root + "/" + action_clean
+
+        return base_root + "/" + action_clean
 
     def _rewrite_payload_for_provider(self, provider: Provider, action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         """虚拟模型 -> 真实模型映射。
@@ -1855,6 +1892,81 @@ class ProxyHandler(BaseHTTPRequestHandler):
             total = prompt + completion
             self.state.emit("📊", f"tokens: ↑{prompt} ↓{completion} ∑{total}")
 
+    def _handle_forward(self, action: str) -> None:
+        """通用转发：图片/视频等端点直接透传，不改写 payload。"""
+        assert self.state is not None
+        cur = self.state.current()
+        if not cur:
+            self._send_json(503, {"error": {"message": "no active provider", "type": "no_provider"}})
+            return
+        raw = self._read_body()
+        try:
+            payload = json.loads(raw.decode("utf-8") or "{}") if raw else {}
+        except Exception as e:
+            self._send_json(400, {"error": {"message": f"invalid json: {e}", "type": "bad_request"}})
+            return
+        url = self._upstream_endpoint(cur, action)
+        self.state.emit("ℹ️", f"收到 /v1/{action}  model={payload.get('model', '(无)')}")
+        try:
+            resp_body, resp_headers, resp_code = self._do_upstream(cur, url, payload)
+        except Exception as e:
+            self._send_json(502, {"error": {"message": f"upstream error: {e}", "type": "upstream_error"}})
+            return
+        if resp_code >= 400:
+            if isinstance(resp_body, dict):
+                self._send_json(resp_code, resp_body)
+            else:
+                self._send_json(resp_code, {"error": {"message": str(resp_body), "type": "upstream_error"}})
+        else:
+            try:
+                self._send_json(resp_code, resp_body if isinstance(resp_body, dict) else {"content": str(resp_body)})
+            except Exception:
+                self._send_json(resp_code, {"content": str(resp_body) if resp_body is not None else ""})
+
+    def _handle_forward_get(self, path: str) -> None:
+        """通用 GET 转发（视频状态轮询等）。"""
+        assert self.state is not None
+        cur = self.state.current()
+        if not cur:
+            self._send_json(503, {"error": {"message": "no active provider", "type": "no_provider"}})
+            return
+        base = normalize_base_url(cur.base_url) or ""
+        base = base.rstrip("/")
+        url = base + "/" + path.lstrip("/")
+        self.state.emit("ℹ️", f"GET 转发: {url}")
+        try:
+            ssl_ctx = self._create_ssl_context()
+            req = urllib.request.Request(
+                url, method="GET",
+                headers={
+                    "Authorization": f"Bearer {cur.api_key}",
+                    "Accept": "application/json",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ccswith-proxy/1.0",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=30, context=ssl_ctx) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+                parsed: Any = raw
+                if raw:
+                    try:
+                        parsed = json.loads(raw)
+                    except Exception:
+                        parsed = raw
+                self._send_json(resp.getcode() or 200, parsed)
+        except urllib.error.HTTPError as e:
+            try:
+                body = e.read().decode("utf-8", errors="replace")
+                parsed: Any = body
+                try:
+                    parsed = json.loads(body)
+                except Exception:
+                    pass
+                self._send_json(e.code, parsed)
+            except Exception:
+                self._send_json(e.code, {"error": {"message": str(e), "type": "upstream_error"}})
+        except Exception as e:
+            self._send_json(502, {"error": {"message": f"upstream error: {e}", "type": "upstream_error"}})
+
     def _handle_chat_completions(self) -> None:
         assert self.state is not None
         cur = self.state.current()
@@ -1868,9 +1980,23 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": {"message": f"invalid json: {e}", "type": "bad_request"}})
             return
         payload = self._rewrite_payload_for_provider(cur, "chat/completions", payload)
-        url = self._upstream_endpoint(cur, "chat/completions")
+        # 根据改写后的真实模型名自动推断端点
+        action = "chat/completions"
+        real_model = (payload or {}).get("model", "")
+        if isinstance(real_model, str):
+            ml = real_model.lower().strip()
+            if "image" in ml or "dall" in ml:
+                action = "images/generations"
+            elif "video" in ml:
+                action = "videos"
+        url = self._upstream_endpoint(cur, action)
         stream = bool(payload.get("stream"))
-        self.state.emit("ℹ️", f"收到 /v1/chat/completions  model={payload.get('model')} stream={stream}")
+        if action != "chat/completions":
+            # 非 chat 端点：上游响应是普通 JSON，不是 SSE 流 → 强制非流式
+            payload["stream"] = False
+            stream = False
+        ep_label = f" → {action}" if action != "chat/completions" else ""
+        self.state.emit("ℹ️", f"收到 /v1/chat/completions  model={payload.get('model')}{ep_label} stream={stream}")
         try:
             resp_body, resp_headers, resp_code = self._do_upstream(cur, url, payload)
         except Exception as e:

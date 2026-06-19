@@ -907,19 +907,7 @@ class App(ctk.CTk):
             self.provider_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_combo_selected())
         except Exception:
             pass
-        self.auto_backup = tk.BooleanVar(value=True)
-        ctk.CTkCheckBox(
-            pick_row,
-            text="切换前自动备份",
-            variable=self.auto_backup,
-            fg_color=CHECK_BG,
-            hover_color=CHECK_BG,
-            border_color=CHECK_BORDER,
-            checkmark_color=CHECK_FG,
-            text_color=TAG_TEXT,
-        ).pack(side="left", padx=10)
-
-        # 模型 ID 下拉行（在切换前自动备份之后）
+        # 模型 ID 下拉行
         model_row = ctk.CTkFrame(self._center, fg_color=self.skin_body)
         model_row.pack(fill="x", padx=10, pady=(0, 2))
         ctk.CTkLabel(model_row, text="📋 模型 ID", text_color=TAG_TEXT).pack(side="left")
@@ -931,6 +919,17 @@ class App(ctk.CTk):
             pass
         self.current_model_lbl = ctk.CTkLabel(model_row, text="", text_color="#C62828")
         self.current_model_lbl.pack(side="left", padx=4)
+        confirm_btn = ctk.CTkButton(
+            model_row,
+            text="✅ 确定",
+            width=72,
+            fg_color=BUTTON_PRIMARY,
+            hover_color=BUTTON_SECONDARY,
+            text_color="#FFFFFF",
+            command=self._on_model_confirm,
+        )
+        confirm_btn.pack(side="left", padx=4)
+        self._bind_tooltip(confirm_btn, "确认使用当前下拉选中的模型 ID")
 
         # 切换 / 备份 / 回滚
         row1 = ctk.CTkFrame(self._center, fg_color=self.skin_body)
@@ -1553,7 +1552,7 @@ class App(ctk.CTk):
                 fg_color=BUTTON_PRIMARY,
                 hover_color=BUTTON_SECONDARY,
                 text_color="#FFFFFF",
-                command=lambda a=p.alias: self._switch_in_background(a),
+                command=lambda a=p.alias: self._switch_in_background(a, model=self._get_model_for_alias(a)),
             )
             switch_btn.pack(side="right", padx=2)
 
@@ -1618,6 +1617,18 @@ class App(ctk.CTk):
     # ----------------------- 动作 -----------------------
     def _run_async(self, fn) -> None:
         threading.Thread(target=fn, daemon=True).start()
+
+    def _get_model_for_alias(self, alias: str) -> str:
+        """获取该服务商的选中模型，无选中时取逗号列表第一个。"""
+        m = self._selected_models.get(alias, "")
+        if m:
+            return m
+        p = self.engine.manager.get(alias)
+        if p and p.model:
+            parts = [x.strip() for x in p.model.split(",") if x.strip()]
+            if parts:
+                return parts[0]
+        return ""
 
     def on_add_provider(self) -> None:
         def _saved(p: "Provider", closed: bool) -> None:
@@ -1915,27 +1926,14 @@ class App(ctk.CTk):
         self._save_enabled_clis()
 
     def _on_combo_selected(self) -> None:
-        """服务商下拉切换后立即生效（更新 current + 刷新列表）。"""
+        """服务商下拉切换后更新内部状态（不写 CLI 配置）。"""
         alias = (self.provider_combo.get() or "").strip()
         if not alias:
             return
-        try:
-            ok = self.engine.manager.set_current(alias)
-            if ok:
-                self._toast(f"✅ 已切换当前服务商: {alias}")
-            else:
-                self._toast(f"❌ 切换失败: 找不到 {alias}")
-        except Exception as e:
-            self._toast(f"❌ 切换失败: {e}")
-            return
-        try:
-            self.refresh_provider_list()
-        except Exception:
-            pass
-        try:
-            self._update_model_combo()
-        except Exception:
-            pass
+        self.engine.manager.set_current(alias)
+        self._update_model_combo()
+        m = self._get_model_for_alias(alias)
+        self._log("ℹ️", f"已选择服务商: {alias}，模型: {m}")
 
     def _update_model_combo(self) -> None:
         """根据当前服务商下拉框的值，刷新模型 ID 下拉框。
@@ -1966,19 +1964,30 @@ class App(ctk.CTk):
             self.current_model_lbl.configure(text="")
 
     def _on_model_combo_selected(self) -> None:
-        """模型 ID 下拉选中后，仅记录选中值到运行时变量，不覆盖 provider.model。
-
-        保护逗号分隔的完整模型列表不被覆盖，下次打开编辑对话框仍能看到所有模型 ID。
-        """
+        """模型 ID 下拉选中后更新内部状态（不写 CLI 配置）。"""
         alias = (self.provider_combo.get() or "").strip()
         model = (self.model_combo.get() or "").strip()
         if not alias or not model:
             return
         self._selected_models[alias] = model
         self.engine.manager.set_active_model(alias, model)
+        self.engine.manager.set_current(alias)
         self._log("ℹ️", f"已选择模型 ID: {model}")
         self.refresh_provider_list()
-        FloatingToast(self, f"✅ 模型 ID 已选择: {model}", ok=True)
+
+    def _on_model_confirm(self) -> None:
+        """点击✅确定按钮，启用当前模型（仅更新内部状态，不写 CLI 配置）。"""
+        alias = (self.provider_combo.get() or "").strip()
+        model = (self.model_combo.get() or "").strip()
+        if not alias or not model:
+            FloatingToast(self, "⚠️ 请先选择服务商和模型", ok=False)
+            return
+        self._selected_models[alias] = model
+        self.engine.manager.set_active_model(alias, model)
+        self.engine.manager.set_current(alias)
+        self._log("✅", f"确定使用模型: {model}")
+        self.refresh_provider_list()
+        FloatingToast(self, f"✅ 当前模型: {model}", ok=True)
 
     def _save_proxy_key(self) -> None:
         """把代理 API Key 保存到 config.yaml（proxy.api_key）。"""
@@ -2100,7 +2109,8 @@ class App(ctk.CTk):
         if not alias:
             tk.messagebox.showinfo("提示", "请先选择要切换的服务商。", parent=self)
             return
-        self._switch_in_background(alias)
+        m = self._get_model_for_alias(alias)
+        self._switch_in_background(alias, model=m)
 
     def _proxy_url(self) -> tuple[str, int, int]:
         host = self.proxy_host_var.get() or "127.0.0.1"
@@ -2208,24 +2218,18 @@ class App(ctk.CTk):
     def _test_provider(self, alias: str) -> None:
         self._test_provider_availability(alias)
 
-    def _switch_in_background(self, alias: str, also_start_proxy: bool = False) -> None:
+    def _switch_in_background(self, alias: str, also_start_proxy: bool = False, model: str = "") -> None:
         # 从自己维护的勾选字典读（不再依赖 CTkCheckBox 或 BooleanVar）
         clis = [k for k, on in (getattr(self, "cli_selected", {}) or {}).items() if bool(on)]
-        auto = self.auto_backup.get()
         host, port, _ = self._proxy_url()
         proxy_url = f"http://{host}:{port}/v1"
+
+        # ★ 由调用方传入 model（已在主线程中确定），不再从控件读取
+        selected_model = model.strip()
 
         def task():
             self.after(0, lambda: self.set_progress(f"切换 {alias} 中…", 5, 10))
             try:
-                backup_dir = None
-                if auto:
-                    try:
-                        backup_dir = backup_cli_configs()
-                        self.after(0, lambda: self._log("ℹ️", f"快照备份完成: {backup_dir}"))
-                    except Exception as e:
-                        self.after(0, lambda: self._log("❌", f"自动备份失败: {e}"))
-
                 from core import apply_provider_to_cli, Provider, hermes_merge_config, HERMES_VIRTUAL_MODEL
 
                 provider = self.engine.manager.get(alias)
@@ -2234,14 +2238,23 @@ class App(ctk.CTk):
                     return
                 virtual = (self.virtual_model_var.get() or HERMES_VIRTUAL_MODEL).strip() or HERMES_VIRTUAL_MODEL
 
-                # 使用模型 ID 下拉框选中的模型（如果已选），但用副本不影响原始逗号分隔列表
+                # 使用调用方传入的选中模型（副本不影响原始逗号分隔列表）
                 import copy as _copy
-                selected_model = (self.model_combo.get() or "").strip() if hasattr(self, "model_combo") else ""
                 if selected_model:
                     provider_for_switch = _copy.copy(provider)
                     provider_for_switch.model = selected_model
+                elif hasattr(self, "model_combo"):
+                    # 兼容：无传入模型时从控件读取（兜底）
+                    m = (self.model_combo.get() or "").strip()
+                    if m:
+                        provider_for_switch = _copy.copy(provider)
+                        provider_for_switch.model = m
+                    else:
+                        provider_for_switch = provider
                 else:
                     provider_for_switch = provider
+                used_model = provider_for_switch.model
+                self.after(0, lambda m=used_model: self._log("ℹ️", f"切换使用模型 ID: {m}"))
 
                 details = []
                 use_proxy = bool(also_start_proxy) and bool(proxy_url)
@@ -2364,7 +2377,8 @@ class App(ctk.CTk):
         if not alias:
             tk.messagebox.showinfo("提示", "请先选择要切换的服务商。", parent=self)
             return
-        self._switch_in_background(alias, also_start_proxy=True)
+        m = self._get_model_for_alias(alias)
+        self._switch_in_background(alias, also_start_proxy=True, model=m)
 
     def on_test_proxy(self) -> None:
         alias = self.provider_combo.get().strip()
@@ -2556,10 +2570,9 @@ class App(ctk.CTk):
             "  1. 左侧【➕新增】录入服务商的 API Key / BaseURL / 模型\n"
             "  2. 中间下拉选择目标服务商\n"
             "  3. 勾选需要写入的 CLI 工具\n"
-            "  4. 点击【🚀 一键切换】即可\n\n"
+            "  4. 选择服务商或模型 ID 后自动生效\n\n"
             "ℹ️ 目录说明：\n"
-            "  • 程序目录下 config/providers.json 保存服务商列表\n"
-            "  • 程序目录下 config_backups/ 存放自动备份\n\n"
+            "  • 程序目录下 config/providers.json 保存服务商列表\n\n"
             "⚙️ 右键菜单：\n"
             "  在空白区域右键可进行字体/颜色/皮肤的设置\n"
         )
