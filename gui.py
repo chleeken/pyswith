@@ -285,7 +285,7 @@ class ProviderDialog(DialogWithPaste):
             ("显示名称", "display_name"),
             ("API Key", "api_key"),
             ("Base URL", "base_url"),
-            ("默认模型", "model"),
+            ("模型 (多个用逗号分隔, 追加不覆盖)", "model"),
             ("API 格式 (openai/anthropic/deepseek/custom)", "api_format"),
         ]
         # 用一个普通 Frame 放 grid 布局
@@ -354,7 +354,11 @@ class ProviderDialog(DialogWithPaste):
         self._auto_resize_and_center(prefer_size=(720, 560))
 
     def _collect_form_provider(self) -> "Provider | None":
-        """从表单里取字段，校验并构造 Provider。失败返回 None。"""
+        """从表单里取字段，校验并构造 Provider。失败返回 None。
+
+        模型 ID 采用增量合并策略：用户输入的模型 ID 会追加到现有列表，
+        已存在的模型不会被移除。如需删除模型，请在配置文件中手动编辑。
+        """
         data = {k: e.get().strip() for k, e in self.entries.items()}
         data["note"] = self.note_box.get("1.0", tk.END).strip()
         if not data.get("alias"):
@@ -364,12 +368,22 @@ class ProviderDialog(DialogWithPaste):
             data["api_format"] = "openai"
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         created_at = self.provider.created_at if self.provider else now
+
+        # 增量合并模型 ID：用户输入的新 ID 追加到现有列表中，不覆盖
+        user_models = [m.strip() for m in data.get("model", "").split(",") if m.strip()]
+        if self.provider:
+            existing_models = [m.strip() for m in (self.provider.model or "").split(",") if m.strip()]
+            merged = list(dict.fromkeys(existing_models + user_models))
+        else:
+            merged = user_models
+        model_str = ",".join(merged) if merged else data.get("model", "")
+
         return Provider(
             alias=data["alias"],
             display_name=data.get("display_name") or data["alias"],
             base_url=data.get("base_url", ""),
             api_key=data.get("api_key", ""),
-            model=data.get("model", ""),
+            model=model_str,
             api_format=data.get("api_format", "openai"),
             enabled=True,
             note=data.get("note", ""),
@@ -612,6 +626,7 @@ class App(ctk.CTk):
         self.settings = self._load_settings()
         self.lang = tk.StringVar(value="中文")
         self.progress_text = tk.StringVar(value="程序就绪")
+        self._selected_models: dict[str, str] = {}
         self._apply_skin_from_index(self.settings.get("skin_index", DEFAULT_SKIN))
         self._build_ui()
         # 首次刷新
@@ -903,6 +918,19 @@ class App(ctk.CTk):
             checkmark_color=CHECK_FG,
             text_color=TAG_TEXT,
         ).pack(side="left", padx=10)
+
+        # 模型 ID 下拉行（在切换前自动备份之后）
+        model_row = ctk.CTkFrame(self._center, fg_color=self.skin_body)
+        model_row.pack(fill="x", padx=10, pady=(0, 2))
+        ctk.CTkLabel(model_row, text="📋 模型 ID", text_color=TAG_TEXT).pack(side="left")
+        self.model_combo = ctk.CTkComboBox(model_row, values=[], width=300, fg_color=TEXT_BG, text_color=INPUT_FG)
+        self.model_combo.pack(side="left", padx=6)
+        try:
+            self.model_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_model_combo_selected())
+        except Exception:
+            pass
+        self.current_model_lbl = ctk.CTkLabel(model_row, text="", text_color="#C62828")
+        self.current_model_lbl.pack(side="left", padx=4)
 
         # 切换 / 备份 / 回滚
         row1 = ctk.CTkFrame(self._center, fg_color=self.skin_body)
@@ -1565,11 +1593,16 @@ class App(ctk.CTk):
         # 状态显示
         cur = self.engine.manager.get_current()
         if cur:
-            self.current_lbl.configure(text=f"{cur.display_name} [{cur.alias}] 模型={cur.model or '(未设置)'}")
+            # 显示选中模型（_selected_models）或第一个模型，不显示完整逗号分隔列表
+            all_models = [m.strip() for m in (cur.model or "").split(",") if m.strip()]
+            display_model = self._selected_models.get(cur.alias, all_models[0] if all_models else cur.model or '')
+            self.current_lbl.configure(text=f"{cur.display_name} [{cur.alias}] 模型={display_model or '(未设置)'}")
             self.status_led.configure(fg="#2ECC71")
         else:
             self.current_lbl.configure(text="（未设置）")
             self.status_led.configure(fg="#95a5a6")
+
+        self._update_model_combo()
 
     def select_all_providers(self) -> None:
         for v, _ in getattr(self, "provider_vars", []):
@@ -1899,6 +1932,53 @@ class App(ctk.CTk):
             self.refresh_provider_list()
         except Exception:
             pass
+        try:
+            self._update_model_combo()
+        except Exception:
+            pass
+
+    def _update_model_combo(self) -> None:
+        """根据当前服务商下拉框的值，刷新模型 ID 下拉框。
+
+        用 self._selected_models 记录已选模型，不覆盖 provider.model（保护逗号分隔列表）。
+        """
+        if not hasattr(self, "model_combo"):
+            return
+        alias = (self.provider_combo.get() or "").strip()
+        models: list[str] = []
+        current_model = ""
+        if alias:
+            provider = self.engine.manager.get(alias)
+            if provider and provider.model:
+                models = [m.strip() for m in provider.model.split(",") if m.strip()]
+                # 优先使用已保存的选择，否则用第一个
+                current_model = self._selected_models.get(alias, models[0] if models else "")
+        self.model_combo.configure(values=models)
+        if current_model and current_model in models:
+            self.model_combo.set(current_model)
+        elif models:
+            self.model_combo.set(models[0])
+        else:
+            self.model_combo.set("")
+        if current_model:
+            self.current_model_lbl.configure(text=f"当前模型: {current_model}")
+        else:
+            self.current_model_lbl.configure(text="")
+
+    def _on_model_combo_selected(self) -> None:
+        """模型 ID 下拉选中后，仅记录选中值到运行时变量，不覆盖 provider.model。
+
+        保护逗号分隔的完整模型列表不被覆盖，下次打开编辑对话框仍能看到所有模型 ID。
+        """
+        alias = (self.provider_combo.get() or "").strip()
+        model = (self.model_combo.get() or "").strip()
+        if not alias or not model:
+            return
+        self._selected_models[alias] = model
+        self.engine.manager.set_active_model(alias, model)
+        self._log("ℹ️", f"已选择模型 ID: {model}")
+        self.refresh_provider_list()
+        FloatingToast(self, f"✅ 模型 ID 已选择: {model}", ok=True)
 
     def _save_proxy_key(self) -> None:
         """把代理 API Key 保存到 config.yaml（proxy.api_key）。"""
@@ -2050,12 +2130,16 @@ class App(ctk.CTk):
                 return
             self.after(0, lambda: self.set_progress(f"测试 {p.display_name}…", 1, 3))
             base = (p.base_url or "").rstrip("/")
-            if base.endswith("/v1"):
+            # 与 _upstream_endpoint 保持一致的版本前缀检测
+            version_prefixes = {"/v1", "/v3", "/v4", "/v5"}
+            if any(vp in base for vp in version_prefixes):
                 upstream = f"{base}/chat/completions"
             else:
                 upstream = f"{base}/v1/chat/completions"
+            # 用当前选中模型（下拉框中的单个 ID），避免发送逗号列表
+            active_model = self.engine.manager.get_active_model(alias) or p.model or "gpt-4o-mini"
             payload = {
-                "model": p.model or "gpt-4o-mini",
+                "model": active_model,
                 "messages": [{"role": "user", "content": "ping"}],
                 "stream": False,
             }
@@ -2150,24 +2234,33 @@ class App(ctk.CTk):
                     return
                 virtual = (self.virtual_model_var.get() or HERMES_VIRTUAL_MODEL).strip() or HERMES_VIRTUAL_MODEL
 
+                # 使用模型 ID 下拉框选中的模型（如果已选），但用副本不影响原始逗号分隔列表
+                import copy as _copy
+                selected_model = (self.model_combo.get() or "").strip() if hasattr(self, "model_combo") else ""
+                if selected_model:
+                    provider_for_switch = _copy.copy(provider)
+                    provider_for_switch.model = selected_model
+                else:
+                    provider_for_switch = provider
+
                 details = []
                 use_proxy = bool(also_start_proxy) and bool(proxy_url)
                 for i, key in enumerate(clis):
                     try:
                         if key == "hermes":
-                            yaml_path, msg = hermes_merge_config(provider, proxy_url, virtual)
+                            yaml_path, msg = hermes_merge_config(provider_for_switch, proxy_url, virtual)
                             details.append((key, str(yaml_path), True, msg))
                         elif key == "codex":
                             # Codex 0.116+ 必须显式填 model_provider，走代理时是 openai，
                             # 直连时根据 api_format 动态选 openai/anthropic/google/...
                             for pth, ok, msg in apply_provider_to_cli(
-                                provider, key,
+                                provider_for_switch, key,
                                 use_proxy=use_proxy,
                                 proxy_base_url=proxy_url or "",
                             ):
                                 details.append((key, str(pth), ok, msg))
                         else:
-                            for pth, ok, msg in apply_provider_to_cli(provider, key):
+                            for pth, ok, msg in apply_provider_to_cli(provider_for_switch, key):
                                 details.append((key, str(pth), ok, msg))
                     except Exception as e:
                         details.append((key, "", False, f"{e}"))
@@ -2209,7 +2302,7 @@ class App(ctk.CTk):
                     self.result_text.delete("1.0", tk.END)
                     self.result_text.insert(
                         "1.0",
-                        f"服务商: {alias}\n模型: {provider.model or '(未设置)'}\nBaseURL: {provider.base_url or '(未设置)'}\n"
+                        f"服务商: {alias}\n模型: {provider_for_switch.model or '(未设置)'}\nBaseURL: {provider_for_switch.base_url or '(未设置)'}\n"
                         f"代理: {proxy_url}\n虚拟模型: {virtual}\n\n",
                     )
                     for cli_key, pth, ok, msg in details:

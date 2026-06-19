@@ -212,6 +212,7 @@ class ProviderManager:
         self.env_file = self.config_dir / ".env"
         self.providers: Dict[str, Provider] = {}
         self.current_alias: Optional[str] = None
+        self.active_models: Dict[str, str] = {}  # alias -> 当前选中的单个模型ID
         self._raw: Dict[str, Any] = {}
         self.load()
 
@@ -406,6 +407,22 @@ class ProviderManager:
         elif "current_provider" in self._raw:
             del self._raw["current_provider"]
         self._write_config()
+
+    # ----------------------- 当前选中模型管理 -----------------------
+    def set_active_model(self, alias: str, model: str) -> None:
+        """记录用户在下拉框中选中的模型 ID（单个）。"""
+        self.active_models[alias] = model
+
+    def get_active_model(self, alias: str) -> str:
+        """获取当前选中的模型 ID；若无记录则从逗号分隔列表中取第一个。"""
+        if alias in self.active_models:
+            return self.active_models[alias]
+        provider = self.providers.get(alias)
+        if provider and provider.model:
+            parts = [x.strip() for x in provider.model.split(",") if x.strip()]
+            if parts:
+                return parts[0]
+        return ""
 
     # ----------------------- 服务商增删改查 -----------------------
     def add_or_update(self, provider: Provider) -> None:
@@ -1698,7 +1715,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
         base = normalize_base_url(provider.base_url) or ""
         base = base.rstrip("/")
         action_clean = action.lstrip("/")
-        if "/v1" in base or "/v3" in base or "/v4" in base or "/v5" in base:
+        version_prefixes = {"/v1", "/v3", "/v4", "/v5"}
+        if any(vp in base for vp in version_prefixes):
             # 已含 API 版本前缀，直接拼 action
             return base + "/" + action_clean
         # 统一拼 /v1/action（OpenAI 标准）
@@ -1732,14 +1750,26 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 virtual_aliases.add(str(HERMES_VIRTUAL_MODEL))
         except Exception:
             pass
+        # 取当前选中模型（用户在下拉框中选择的单个 ID），
+        # 若无选中则从逗号分隔列表中取第一个。
+        def _effective_model() -> str:
+            if self.state and self.state.manager:
+                active = self.state.manager.get_active_model(provider.alias)
+                if active:
+                    return active
+            # fallback：逗号列表的第一个
+            parts = [x.strip() for x in (provider.model or "").split(",") if x.strip()]
+            return parts[0] if parts else (provider.model or "")
+
         if "model" in p:
             p_model = str(p["model"])
             if p_model in virtual_aliases or p_model in (provider.alias, provider.display_name):
-                real = provider.model or p_model
-                p["model"] = real
-        # 若调用方没给 model，补上 provider.model
-        if not p.get("model") and provider.model:
-            p["model"] = provider.model
+                p["model"] = _effective_model() or p_model
+        # 若调用方没给 model，补上选中模型
+        if not p.get("model"):
+            eff = _effective_model()
+            if eff:
+                p["model"] = eff
 
         # ----------- max_tokens 兜底 -----------
         # 很多 CLI（Codex / Hermes / Claude Code）会发 max_tokens=0 或 max_tokens=null
