@@ -4,28 +4,39 @@ git_manger.py
 AGENTS.md
 config.yaml
 #### Suffix ignore ####
-.env
-.paml
-.pyc
-.pyo
-.log
-.tmp
-.bak
-# Editor / OS
+*.env
+*.paml
+*.pyc
+*.pyo
+*.log
+*.tmp
+*.bak
+*.sqlite
+*.db
+*.sqlite3
+*.ini
+*.token
+*.key
+*.pem
+*.crt
+*.cer
+*.pfx
+*.p12
+#### Editor / OS ####
 .vscode/
 .idea/
 .DS_Store
 Thumbs.db
-# Python cache
+#### Python cache ####
 __pycache__/
 *.egg-info/
-# Node / JS
+#### Node / JS ####
 node_modules/
 .npm/
-# Build / dist
+#### Build / dist ####
 tmp_uploads/
 dist/
 build/
 *.spec/
-# Chat & logs (project private)
+#### Chat & logs (project private) ####
 chat_history/
