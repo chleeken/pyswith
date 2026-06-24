@@ -287,6 +287,7 @@ class ProviderDialog(DialogWithPaste):
             ("Base URL", "base_url"),
             ("模型 (多个用逗号分隔, 追加不覆盖)", "model"),
             ("API 格式 (openai/anthropic/deepseek/custom)", "api_format"),
+            ("每分钟最大请求数 (0=不限制)", "rate_limit"),
         ]
         # 用一个普通 Frame 放 grid 布局
         inner = ctk.CTkFrame(content_area, fg_color=FRAME_BG)
@@ -313,10 +314,23 @@ class ProviderDialog(DialogWithPaste):
             if values.get(key):
                 ent.insert(0, str(values[key]))
 
+        self.dedup_var = tk.BooleanVar(value=bool(values.get("deduplicate", True)))
+        dedup_row = len(fields)
+        ctk.CTkCheckBox(
+            inner,
+            text="单次请求中重复信息合并 (默认勾选)",
+            variable=self.dedup_var,
+            fg_color=CHECK_BG,
+            hover_color=CHECK_BG,
+            border_color=CHECK_BORDER,
+            checkmark_color=CHECK_FG,
+            text_color=TAG_TEXT,
+        ).grid(row=dedup_row, column=0, columnspan=2, sticky="w", padx=6, pady=4)
+
         note_lbl = ctk.CTkLabel(inner, text="📋 备注", text_color=TAG_TEXT, anchor="w")
-        note_lbl.grid(row=len(fields), column=0, sticky="w", padx=6, pady=4)
+        note_lbl.grid(row=dedup_row + 1, column=0, sticky="w", padx=6, pady=4)
         self.note_box = ctk.CTkTextbox(inner, height=70, fg_color=TEXT_BG, text_color=INPUT_FG)
-        self.note_box.grid(row=len(fields), column=1, columnspan=2, sticky="we", padx=4, pady=4)
+        self.note_box.grid(row=dedup_row + 1, column=1, columnspan=2, sticky="we", padx=4, pady=4)
         if values.get("note"):
             self.note_box.insert("1.0", str(values["note"]))
 
@@ -378,6 +392,13 @@ class ProviderDialog(DialogWithPaste):
             merged = user_models
         model_str = ",".join(merged) if merged else data.get("model", "")
 
+        # 速率限制（整数）
+        try:
+            rate_limit = int(data.get("rate_limit", "0"))
+        except ValueError:
+            rate_limit = 0
+        deduplicate = self.dedup_var.get()
+
         return Provider(
             alias=data["alias"],
             display_name=data.get("display_name") or data["alias"],
@@ -389,6 +410,8 @@ class ProviderDialog(DialogWithPaste):
             note=data.get("note", ""),
             created_at=created_at,
             updated_at=now,
+            rate_limit=rate_limit,
+            deduplicate=deduplicate,
         )
 
     def _persist_to_manager(self, p: "Provider") -> bool:

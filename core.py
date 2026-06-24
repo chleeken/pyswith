@@ -161,6 +161,8 @@ class Provider:
     note: str = ""
     created_at: str = ""
     updated_at: str = ""
+    rate_limit: int = 0
+    deduplicate: bool = True
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -180,6 +182,8 @@ class Provider:
             note=data.get("note", ""),
             created_at=data.get("created_at") or now,
             updated_at=data.get("updated_at") or now,
+            rate_limit=int(data.get("rate_limit", 0)),
+            deduplicate=bool(data.get("deduplicate", True)),
         )
 
 
@@ -1453,6 +1457,7 @@ class ProxyState:
         self.token_usage = TokenUsage()
         self._token_file = self.manager.config_dir / "token_usage.json"
         self._load_token_usage()
+        self._rate_windows: Dict[str, List[float]] = {}
 
     # ---------- token 用量 ----------
 
@@ -1474,6 +1479,21 @@ class ProxyState:
             )
         except Exception as e:
             logger.warning("token_usage 保存失败: %s", e)
+
+    def check_rate_limit(self, alias: str, limit: int) -> Optional[float]:
+        """检查速率限制，返回建议的等待秒数。limit=0 时不限制。"""
+        if limit <= 0:
+            return None
+        now = time.time()
+        with self._lock:
+            timestamps = self._rate_windows.setdefault(alias, [])
+            cutoff = now - 60.0
+            timestamps[:] = [t for t in timestamps if t > cutoff]
+            if len(timestamps) >= limit:
+                wait = timestamps[0] + 60.0 - now
+                return max(wait, 0.1)
+            timestamps.append(now)
+            return None
 
     def record_tokens(self, prompt_tokens: int, completion_tokens: int) -> None:
         """记录一次 API 调用的 token 用量并持久化。"""
@@ -1979,6 +1999,17 @@ class ProxyHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self._send_json(400, {"error": {"message": f"invalid json: {e}", "type": "bad_request"}})
             return
+        # 单次请求中重复信息合并
+        if cur.deduplicate and "messages" in payload:
+            merged = []
+            for msg in payload["messages"]:
+                if merged and msg.get("role") == merged[-1].get("role") and msg.get("content") == merged[-1].get("content"):
+                    self.state.emit("ℹ️", f"去重合并: 跳过重复的 {msg.get('role')} 消息")
+                    continue
+                merged.append(msg)
+            if len(merged) != len(payload["messages"]):
+                payload["messages"] = merged
+                self.state.emit("ℹ️", f"已合并 {len(payload['messages'])} 条去重后消息")
         payload = self._rewrite_payload_for_provider(cur, "chat/completions", payload)
         # 根据改写后的真实模型名自动推断端点
         action = "chat/completions"
@@ -2058,6 +2089,17 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         # 统一映射成 chat.completions 格式
         chat_payload = self._responses_to_chat(payload)
+        # 单次请求中重复信息合并
+        if cur.deduplicate and "messages" in chat_payload:
+            merged = []
+            for msg in chat_payload["messages"]:
+                if merged and msg.get("role") == merged[-1].get("role") and msg.get("content") == merged[-1].get("content"):
+                    self.state.emit("ℹ️", f"去重合并: 跳过重复的 {msg.get('role')} 消息")
+                    continue
+                merged.append(msg)
+            if len(merged) != len(chat_payload["messages"]):
+                chat_payload["messages"] = merged
+                self.state.emit("ℹ️", f"已合并 {len(chat_payload['messages'])} 条去重后消息")
         chat_payload = self._rewrite_payload_for_provider(cur, "chat/completions", chat_payload)
         url = self._upstream_endpoint(cur, "chat/completions")
         stream = bool(chat_payload.get("stream"))
@@ -2339,6 +2381,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
         use_anthropic_messages: bool = False,
     ) -> Tuple[Any, Dict[str, str], int]:
         assert self.state is not None
+        # 速率限制检查（滑动窗口）
+        if provider.rate_limit > 0:
+            wait = self.state.check_rate_limit(provider.alias, provider.rate_limit)
+            if wait is not None:
+                self.state.emit("⚠️", f"速率限制 {provider.rate_limit}/分钟，等待 {wait:.1f}s ...")
+                try:
+                    time.sleep(wait)
+                except KeyboardInterrupt:
+                    pass
         # 是否流式
         stream = bool(payload.get("stream"))
         self.state.emit("📊", f"转发请求 -> {url}  stream={stream}")
