@@ -3,18 +3,42 @@
 git_manger.py
 AGENTS.md
 config.yaml
-#### Suffix ignore ####
+credentials.json
+.netrc
+#### Privacy / big files ####
 *.env
 *.paml
+*.db
+*.duckdb
+*.csv
+*.bak
+*.tmp
+*.log
+*.sqlite3
 *.pyc
 *.pyo
-*.log
-*.tmp
-*.bak
-*.sqlite
-*.db
-*.sqlite3
-*.ini
+*.class
+*.o
+*.so
+*.dylib
+*.dll
+*.lib
+*.a
+*.obj
+*.pdb
+*.idb
+*.i64
+*.egg-info
+*.whl
+*.tar.gz
+*.zip
+*.7z
+*.rar
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.engine
 *.token
 *.key
 *.pem
@@ -22,21 +46,21 @@ config.yaml
 *.cer
 *.pfx
 *.p12
+#### User dirs ####
+.idea/
+.vscode/
+backup/
+build/
+chat_history/
+dist/
+download/
+output/
+tmp_uploads/
 #### Editor / OS ####
 .vscode/
 .idea/
 .DS_Store
 Thumbs.db
-#### Python cache ####
 __pycache__/
-*.egg-info/
-#### Node / JS ####
 node_modules/
 .npm/
-#### Build / dist ####
-tmp_uploads/
-dist/
-build/
-*.spec/
-#### Chat & logs (project private) ####
-chat_history/
