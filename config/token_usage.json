@@ -1,10 +1,10 @@
 {
-  "daily_prompt": 6250940,
-  "daily_completion": 30370,
-  "daily_total": 6281310,
-  "monthly_prompt": 11530740,
-  "monthly_completion": 131112,
-  "monthly_total": 11661852,
-  "last_date": "2026-06-19",
+  "daily_prompt": 787,
+  "daily_completion": 87,
+  "daily_total": 874,
+  "monthly_prompt": 11531527,
+  "monthly_completion": 131199,
+  "monthly_total": 11662726,
+  "last_date": "2026-06-25",
   "last_month": "2026-06"
 }

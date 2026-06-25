@@ -161,6 +161,8 @@ class Provider:
     note: str = ""
     created_at: str = ""
     updated_at: str = ""
+    rate_limit: int = 0
+    deduplicate: bool = True
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -180,6 +182,8 @@ class Provider:
             note=data.get("note", ""),
             created_at=data.get("created_at") or now,
             updated_at=data.get("updated_at") or now,
+            rate_limit=int(data.get("rate_limit", 0)),
+            deduplicate=bool(data.get("deduplicate", True)),
         )
 
 
@@ -1453,6 +1457,7 @@ class ProxyState:
         self.token_usage = TokenUsage()
         self._token_file = self.manager.config_dir / "token_usage.json"
         self._load_token_usage()
+        self._rate_windows: Dict[str, List[float]] = {}
 
     # ---------- token 用量 ----------
 
@@ -1474,6 +1479,21 @@ class ProxyState:
             )
         except Exception as e:
             logger.warning("token_usage 保存失败: %s", e)
+
+    def check_rate_limit(self, alias: str, limit: int) -> Optional[float]:
+        """检查速率限制，返回建议的等待秒数。limit=0 时不限制。"""
+        if limit <= 0:
+            return None
+        now = time.time()
+        with self._lock:
+            timestamps = self._rate_windows.setdefault(alias, [])
+            cutoff = now - 60.0
+            timestamps[:] = [t for t in timestamps if t > cutoff]
+            if len(timestamps) >= limit:
+                wait = timestamps[0] + 60.0 - now
+                return max(wait, 0.1)
+            timestamps.append(now)
+            return None
 
     def record_tokens(self, prompt_tokens: int, completion_tokens: int) -> None:
         """记录一次 API 调用的 token 用量并持久化。"""
@@ -1534,12 +1554,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     def _send_json(self, code: int, obj: Any) -> None:
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+        except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError, OSError):
+            pass
 
     def _read_body(self) -> bytes:
         n = int(self.headers.get("Content-Length", "0") or 0)
@@ -1798,21 +1821,21 @@ class ProxyHandler(BaseHTTPRequestHandler):
             parts = [x.strip() for x in (provider.model or "").split(",") if x.strip()]
             return parts[0] if parts else (provider.model or "")
 
-        if "model" in p:
-            p_model = str(p["model"])
-            if p_model in virtual_aliases or p_model in (provider.alias, provider.display_name):
-                p["model"] = _effective_model() or p_model
-        # 若调用方没给 model，补上选中模型
-        if not p.get("model"):
-            eff = _effective_model()
-            if eff:
-                p["model"] = eff
+        eff = _effective_model()
+        # 只要有有效模型，始终改写（不管客户端发的是什么）
+        if eff:
+            p["model"] = eff
+        # 若调用方没给 model 且没有有效模型，补虚拟别名
+        elif not p.get("model"):
+            p["model"] = "virtual-model"
 
         # ----------- max_tokens 兜底 -----------
         # 很多 CLI（Codex / Hermes / Claude Code）会发 max_tokens=0 或 max_tokens=null
         # 上游 DeepSeek / 硅基流动 / OpenAI 都不接受 0 或负数 → 400
         # 统一把非法值修正掉
+        # 部分模型（如 NVIDIA）不支持超过 32768，统一截断避免 400
         DEFAULT_MAX_TOKENS = 512
+        MAX_OUTPUT_TOKENS_CAP = 32768
         for key in ("max_tokens", "max_output_tokens"):
             if key in p:
                 val = p[key]
@@ -1824,7 +1847,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         if val_i <= 0:
                             p[key] = DEFAULT_MAX_TOKENS
                         else:
-                            p[key] = val_i
+                            capped = min(val_i, MAX_OUTPUT_TOKENS_CAP)
+                            if capped != val_i:
+                                p[key] = capped
+                            else:
+                                p[key] = val_i
                 except Exception:
                     p[key] = DEFAULT_MAX_TOKENS
 
@@ -1980,6 +2007,17 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": {"message": f"invalid json: {e}", "type": "bad_request"}})
             return
         payload = self._rewrite_payload_for_provider(cur, "chat/completions", payload)
+        # 单次请求中重复信息合并
+        if cur.deduplicate and "messages" in payload:
+            merged = []
+            for msg in payload["messages"]:
+                if merged and msg.get("role") == merged[-1].get("role") and msg.get("content") == merged[-1].get("content"):
+                    self.state.emit("ℹ️", f"去重合并: 跳过重复的 {msg.get('role')} 消息")
+                    continue
+                merged.append(msg)
+            if len(merged) != len(payload["messages"]):
+                payload["messages"] = merged
+                self.state.emit("ℹ️", f"已合并 {len(payload['messages'])} 条去重后消息")
         # 根据改写后的真实模型名自动推断端点
         action = "chat/completions"
         real_model = (payload or {}).get("model", "")
@@ -2059,6 +2097,17 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # 统一映射成 chat.completions 格式
         chat_payload = self._responses_to_chat(payload)
         chat_payload = self._rewrite_payload_for_provider(cur, "chat/completions", chat_payload)
+        # 单次请求中重复信息合并
+        if cur.deduplicate and "messages" in chat_payload:
+            merged = []
+            for msg in chat_payload["messages"]:
+                if merged and msg.get("role") == merged[-1].get("role") and msg.get("content") == merged[-1].get("content"):
+                    self.state.emit("ℹ️", f"去重合并: 跳过重复的 {msg.get('role')} 消息")
+                    continue
+                merged.append(msg)
+            if len(merged) != len(chat_payload["messages"]):
+                chat_payload["messages"] = merged
+                self.state.emit("ℹ️", f"已合并 {len(chat_payload['messages'])} 条去重后消息")
         url = self._upstream_endpoint(cur, "chat/completions")
         stream = bool(chat_payload.get("stream"))
         self.state.emit(
@@ -2339,6 +2388,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
         use_anthropic_messages: bool = False,
     ) -> Tuple[Any, Dict[str, str], int]:
         assert self.state is not None
+        # 速率限制检查（滑动窗口）
+        if provider.rate_limit > 0:
+            wait = self.state.check_rate_limit(provider.alias, provider.rate_limit)
+            if wait is not None:
+                self.state.emit("⚠️", f"速率限制 {provider.rate_limit}/分钟，等待 {wait:.1f}s ...")
+                try:
+                    time.sleep(wait)
+                except KeyboardInterrupt:
+                    pass
         # 是否流式
         stream = bool(payload.get("stream"))
         self.state.emit("📊", f"转发请求 -> {url}  stream={stream}")
@@ -2389,6 +2447,22 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     body_raw = b""
                     body_text = ""
                 self.state.emit("❌", f"上游 HTTP 错误 code={code}  body={body_text[:400]}")
+                # max_tokens 超限自动修复: 提取上限值, 重发
+                if code == 400 and "max_tokens" in body_text and "above maximum" in body_text and attempt < max_attempts:
+                    import re
+                    m = re.search(r'expected a value <= (\d+)', body_text)
+                    if m:
+                        max_val = int(m.group(1))
+                        old_max = payload.get("max_tokens", payload.get("max_output_tokens", "?"))
+                        for k in ("max_tokens", "max_output_tokens"):
+                            if k in payload:
+                                payload[k] = max_val
+                        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                        req.data = data
+                        self.state.emit("⚠️", f"max_tokens {old_max} → {max_val} 自动降级重试 ({attempt}/{max_attempts})")
+                        delay = base_delay * (2 ** (attempt - 1))
+                        time.sleep(delay)
+                        continue
                 # 429（限流）和 5xx（服务端错误）可重试
                 retryable = (code == 429 or code >= 500) and attempt < max_attempts
                 if retryable:
