@@ -16,10 +16,10 @@ providers:
     model: deepseek-ai/deepseek-v4-flash
     api_format: openai
     enabled: true
-    note:
+    note: 
     created_at: 2026-06-13 19:38:21
-    updated_at: 2026-06-18 21:32:28
-    rate_limit: 0
+    updated_at: 2026-06-25 23:15:55
+    rate_limit: 35
     deduplicate: true
   nvidia-v4-flash:
     display_name: nvidia-v4-flash
@@ -38,10 +38,10 @@ providers:
     model: deepseek-v4-flash
     api_format: openai
     enabled: true
-    note:
+    note: 
     created_at: 2026-06-13 20:26:45
-    updated_at: 2026-06-13 20:26:45
-    rate_limit: 0
+    updated_at: 2026-06-25 23:16:36
+    rate_limit: 30
     deduplicate: true
   智谱:
     display_name: 智谱
@@ -49,10 +49,10 @@ providers:
     model: "glm-4-flash,glm-4-air,glm-4-plus,glm-5.2"
     api_format: openai
     enabled: true
-    note:
+    note: 
     created_at: 2026-06-13 20:38:23
-    updated_at: 2026-06-19 08:36:22
-    rate_limit: 0
+    updated_at: 2026-06-25 23:16:15
+    rate_limit: 30
     deduplicate: true
   agents ai:
     display_name: agents ai
@@ -71,10 +71,10 @@ providers:
     model: ep-20260528001214-5fc9g
     api_format: openai
     enabled: true
-    note:
+    note: 
     created_at: 2026-06-15 21:58:41
-    updated_at: 2026-06-15 21:58:59
-    rate_limit: 0
+    updated_at: 2026-06-25 23:16:26
+    rate_limit: 30
     deduplicate: true
   codex公益:
     display_name: codex公益
@@ -98,7 +98,7 @@ providers:
     updated_at: 2026-06-19 20:10:21
     rate_limit: 0
     deduplicate: true
-current_provider: agents ai
+current_provider: 英伟达
 proxy:
   host: 127.0.0.1
   port: 3000
