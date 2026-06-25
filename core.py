@@ -2006,6 +2006,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self._send_json(400, {"error": {"message": f"invalid json: {e}", "type": "bad_request"}})
             return
+        # 部分 agent（如 Hermes）发送工具探测请求时不带 messages，但上游要求必须存在
+        if "messages" not in payload or not isinstance(payload.get("messages"), list) or not payload["messages"]:
+            payload["messages"] = [{"role": "user", "content": "."}]
+            self.state.emit("ℹ️", "请求缺少 messages，已自动补默认消息")
         payload = self._rewrite_payload_for_provider(cur, "chat/completions", payload)
         # 单次请求中重复信息合并
         if cur.deduplicate and "messages" in payload:
@@ -2093,6 +2097,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self._send_json(400, {"error": {"message": f"invalid json: {e}", "type": "bad_request"}})
             return
+        # 部分 agent 发送工具探测请求时不带 messages，但上游要求必须存在
+        if "messages" not in payload or not isinstance(payload.get("messages"), list) or not payload["messages"]:
+            payload["messages"] = [{"role": "user", "content": "."}]
+            self.state.emit("ℹ️", "请求缺少 messages，已自动补默认消息")
 
         # 统一映射成 chat.completions 格式
         chat_payload = self._responses_to_chat(payload)
