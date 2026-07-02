@@ -37,6 +37,7 @@ from core import (
     create_proxy_http_server,
     get_backup_dir,
     get_config_dir,
+    get_icon_path,
     get_program_dir,
     list_backups,
     pick_free_port,
@@ -639,7 +640,7 @@ class App(ctk.CTk):
 
         # 图标（Windows）
         try:
-            ico = get_program_dir() / "icon.ico"
+            ico = get_icon_path()
             if ico.exists():
                 self.iconbitmap(str(ico))
         except Exception:
@@ -1070,6 +1071,7 @@ class App(ctk.CTk):
             ("🔄 停止代理", "停止当前运行的 API 网关", self.on_stop_proxy),
             ("📂 代理日志", "打开 config 目录查看运行日志", self.on_open_config_dir),
             ("📋 配置说明", "打开帮助查看代理使用说明", self.on_help),
+            ("➕ 添加配置", "给勾选的CLI项目添加pyswith本地模型配置", self.on_add_pyswith_config),
         ]:
             b = ctk.CTkButton(
                 proxy_btns2,
@@ -2119,6 +2121,71 @@ class App(ctk.CTk):
                 self.token_lbl.configure(text="")
         except Exception:
             pass
+
+    def on_add_pyswith_config(self) -> None:
+        """给勾选的CLI项目添加pyswith本地模型配置。"""
+        clis = [k for k, on in (getattr(self, "cli_selected", {}) or {}).items() if bool(on)]
+        if not clis:
+            FloatingToast(self, "⚠️ 请先勾选目标CLI工具", ok=False)
+            return
+
+        host = self.proxy_host_var.get() or "127.0.0.1"
+        port_raw = (self.proxy_port_var.get() or "").strip()
+        try:
+            port = int(port_raw) if port_raw else 8787
+        except ValueError:
+            port = 8787
+        virtual = (self.virtual_model_var.get() or HERMES_VIRTUAL_MODEL).strip() or HERMES_VIRTUAL_MODEL
+        proxy_url = f"http://{host}:{port}/v1"
+
+        def task():
+            from core import apply_provider_to_cli, hermes_merge_config, HERMES_VIRTUAL_MODEL
+
+            provider = self.engine.manager.get_current()
+            if not provider:
+                self.after(0, lambda: FloatingToast(self, "❌ 请先设置当前服务商", ok=False))
+                return
+
+            import copy as _copy
+            provider_for_config = _copy.copy(provider)
+            provider_for_config.model = virtual
+
+            details = []
+            for i, key in enumerate(clis):
+                try:
+                    if key == "hermes":
+                        yaml_path, msg = hermes_merge_config(provider_for_config, proxy_url, virtual)
+                        details.append((key, str(yaml_path), True, msg))
+                    else:
+                        for pth, ok, msg in apply_provider_to_cli(
+                            provider_for_config, key,
+                            use_proxy=True,
+                            proxy_base_url=proxy_url,
+                            virtual_model=virtual,
+                        ):
+                            details.append((key, str(pth), ok, msg))
+                except Exception as e:
+                    details.append((key, "", False, f"{e}"))
+                self.after(0, lambda v=i: self.set_progress(f"写入进度 {v+1}/{len(clis)}", v + 1, len(clis)))
+
+            def show_result():
+                self.result_text.delete("1.0", tk.END)
+                self.result_text.insert(
+                    "1.0",
+                    f"添加 pyswith 本地模型配置\n代理地址: {proxy_url}\n虚拟模型: {virtual}\n\n",
+                )
+                for cli_key, pth, ok, msg in details:
+                    mark = "✅" if ok else "❌"
+                    line = f"{mark} [{cli_key}] {msg} ({pth})\n"
+                    self.result_text.insert(tk.END, line)
+                success_count = sum(1 for _, _, ok, _ in details if ok)
+                self._log_status(True, f"配置添加完成: {success_count}/{len(clis)}")
+                FloatingToast(self, f"✅ 已为 {success_count}/{len(clis)} 个CLI添加配置", ok=True)
+
+            self.after(0, show_result)
+            self.after(0, lambda: self.set_progress("程序就绪", 0, 10))
+
+        self._run_async(task)
 
     def on_switch(self) -> None:
         alias = self.provider_combo.get().strip()

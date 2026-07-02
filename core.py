@@ -6,6 +6,7 @@ Hermes config.yaml 读写、OpenAI 兼容 HTTP 代理。
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -29,6 +30,35 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urljoin
 
 logger = logging.getLogger("ccswith")
+
+
+_ICON_BASE64 = "AAABAAEAAAABAAEAIACeAAAAFgAAAIlQTkcNChoKAAAADUlIRFIAAABAAAAAQAgGAAAAqmlx3gAAAGVJREFUeNrt0EERAAAEADBhVNTcnxzOHiuw6Mr5LAQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgAABAgQIECBAgID7Fnk6wlmg0E81AAAAAElFTkSuQmCC"
+
+
+def get_icon_path() -> Path:
+    """获取程序图标路径。
+    
+    优先使用程序目录下的icon.ico文件；如果不存在，则将内嵌的Base64图标
+    解压到系统临时目录，返回临时文件路径。
+    
+    支持开发态、PyInstaller打包、Nuitka打包等多种运行环境。
+    """
+    program_dir = get_program_dir()
+    ico_path = program_dir / "icon.ico"
+    if ico_path.exists():
+        return ico_path
+    
+    try:
+        icon_data = base64.b64decode(_ICON_BASE64)
+        tmp_dir = Path(tempfile.gettempdir()) / "ccswith"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        tmp_ico = tmp_dir / "icon.ico"
+        with open(tmp_ico, "wb") as f:
+            f.write(icon_data)
+        return tmp_ico
+    except Exception as e:
+        logger.warning("获取图标路径失败: %s", e)
+        return ico_path
 
 
 # ---------------------------- 路径/目录工具 ----------------------------
@@ -547,7 +577,7 @@ class ProviderManager:
 
 CLI_TEMPLATES: Dict[str, Dict[str, Any]] = {
     "claude_code": {
-        "display": "Claude Code (.env / settings.json)",
+        "display": "Claude Code",
         "paths": {
             "env": ["{HOME}/.claude/.env", "{USERPROFILE}/.claude/.env"],
             "json": ["{HOME}/.claude/settings.json", "{USERPROFILE}/.claude/settings.json"],
@@ -564,17 +594,22 @@ CLI_TEMPLATES: Dict[str, Dict[str, Any]] = {
                 ("model", "model"),
             ],
         },
+        "local_model_template": {
+            "provider_type": "openai",
+            "base_url_key": "ANTHROPIC_BASE_URL",
+            "api_key_key": "ANTHROPIC_API_KEY",
+            "model_key": "ANTHROPIC_MODEL",
+        },
     },
     "codex": {
-        "display": "Codex CLI (config.toml / config.json)",
+        "display": "Codex CLI",
         "paths": {
             "toml": ["{HOME}/.codex/config.toml", "{USERPROFILE}/.codex/config.toml"],
             "json": ["{HOME}/.codex/config.json", "{USERPROFILE}/.codex/config.json"],
         },
         "format_rules": {
-            # Codex 0.116+ 的 key 名（全小写，蛇形）
             "toml": {
-                "model_provider": "model_provider",  # 动态选 openai/anthropic/...
+                "model_provider": "model_provider",
                 "api_key": "api_key",
                 "base_url": "base_url",
                 "model": "model",
@@ -585,9 +620,16 @@ CLI_TEMPLATES: Dict[str, Dict[str, Any]] = {
                 ("model", "model"),
             ],
         },
+        "local_model_template": {
+            "provider_type": "openai",
+            "base_url_key": "base_url",
+            "api_key_key": "api_key",
+            "model_key": "model",
+            "model_provider": "openai",
+        },
     },
     "gemini": {
-        "display": "Gemini CLI (settings.json)",
+        "display": "Gemini CLI",
         "paths": {
             "json": ["{HOME}/.config/gemini/settings.json", "{USERPROFILE}/.config/gemini/settings.json"],
             "env": ["{HOME}/.gemini/.env", "{USERPROFILE}/.gemini/.env"],
@@ -604,12 +646,48 @@ CLI_TEMPLATES: Dict[str, Dict[str, Any]] = {
                 "GEMINI_MODEL": "model",
             },
         },
+        "local_model_template": {
+            "provider_type": "openai",
+            "base_url_key": "GEMINI_BASE_URL",
+            "api_key_key": "GEMINI_API_KEY",
+            "model_key": "GEMINI_MODEL",
+        },
     },
     "hermes": {
-        "display": "Hermes Agent (config.yaml / .env)",
+        "display": "Hermes Agent",
         "paths": {
             "yaml": ["{HERMES_HOME}/config.yaml", "{USERPROFILE}/AppData/Local/hermes/config.yaml", "{HOME}/.hermes/config.yaml"],
             "env": ["{HERMES_HOME}/.env", "{USERPROFILE}/AppData/Local/hermes/.env", "{HOME}/.hermes/.env"],
+        },
+        "local_model_template": {
+            "provider_type": "custom",
+            "provider_name": "ccswitch",
+            "virtual_model_key": "default",
+        },
+    },
+    "opercode": {
+        "display": "Opercode CLI",
+        "paths": {
+            "env": ["{HOME}/.opercode/.env", "{USERPROFILE}/.opercode/.env"],
+            "json": ["{HOME}/.opercode/config.json", "{USERPROFILE}/.opercode/config.json"],
+        },
+        "format_rules": {
+            "env": {
+                "OPENAI_API_KEY": "api_key",
+                "OPENAI_BASE_URL": "base_url",
+                "OPENAI_MODEL": "model",
+            },
+            "json": [
+                ("apiKey", "api_key"),
+                ("baseURL", "base_url"),
+                ("model", "model"),
+            ],
+        },
+        "local_model_template": {
+            "provider_type": "openai",
+            "base_url_key": "OPENAI_BASE_URL",
+            "api_key_key": "OPENAI_API_KEY",
+            "model_key": "OPENAI_MODEL",
         },
     },
 }
